@@ -1,26 +1,86 @@
 # lol-crawler
 
 Rust rewrite of the WRBoost Riot API crawler, implementing the append-only-log
-design from `../crawler_idea.md`. Solo queue (420), dev-key rate limits,
+design from `../crawler_idea.md`. Solo queue (420),
 **apex-cohort strategy**: the crawl is optimized to maximize *full-history
 training samples* — stored matches where all 10 participants also have their
 20 preceding games stored. (Emerald-first crawling was the original idea and
 was replaced by this; the data exists only to make training samples, and the
 apex ladder yields far more of them per request.)
 
-## Run
+## Architecture: server + node fleet
+
+The crawler is split into two programs (workspace crates):
+
+- **`crawler-server`** (`crates/server`) — runs on one host, owns *all*
+  crawl logic and *all* data, and makes **zero** Riot API requests. Every
+  Riot fetch becomes an opaque job `{host, method, path}` handed to a node.
+- **`crawler-node`** (`crates/node`) — a small CLI you give to friends.
+  Each node enrolls once with an invite code, then pulls jobs, executes
+  them with *its operator's own Riot API key* at full rate-limit speed
+  (the same two-layer sliding-window limiters + header adoption the
+  original crawler used), and uploads the raw bodies. Nodes know nothing
+  about the crawl strategy, so the server can evolve freely without
+  breaking deployed nodes.
+- **`crawler-proto`** (`crates/proto`) — the tiny JSON wire protocol
+  (additive-changes-only; version header, 426 on real breaks).
+
+Scheduling is **pull-based**: a node reports how many jobs it holds per
+routing host and the server tops each host up to a small target (8), so
+node-side limiters alone set the pace — a production key applies with no
+change anywhere. Jobs are leased for **2.5 minutes**; unanswered leases
+re-queue for other nodes, and duplicate/stale results are ignored (safe:
+`store_match` re-stores are guarded). The job queue is RAM-only, derived
+from the frontier — a server restart just re-derives work; the seen-bitmap
+prevents refetching.
+
+**Duplicate audits**: a configurable percentage of dispatched jobs
+(`CRAWLER_AUDIT_DUP_PERCENT`, default **1%**) is cloned to a *different*
+node and the two bodies are compared, to catch a node that starts lying or
+serving corrupted data. Immutable endpoints (match, timeline) must match
+exactly ("AUDIT MISMATCH" warning + per-node counters shown in the 60 s
+report); volatile endpoints (matchlists, leagues) only count as soft
+mismatches since ground truth moves between the two fetches. Both nodes of
+a failed pair are flagged — the liar is the one accumulating fails across
+many partners.
+
+### Run the server
 
 ```sh
-cargo run --release
+cargo run --release -p crawler-server
 ```
 
-The API key is read from `$API_KEY` or the nearest `api_key.env`
-(`API_KEY="RGAPI-..."`) walking up from the working directory. Data lands in
-`./data` (override with `CRAWLER_DATA_DIR`). Ctrl-C drains and flushes.
+Data lands in `./data` (override with `CRAWLER_DATA_DIR`). The node API
+binds `0.0.0.0:8420` (override with `CRAWLER_BIND`; put TLS in front with
+a reverse proxy if you expose it publicly). Ctrl-C drains and flushes.
 `RUST_LOG=debug` for verbose logging.
 
 ```sh
-cargo run --release -- backfill
+cargo run --release -p crawler-server -- invite alice
+```
+
+mints a one-time invite code (stored in `data/invites.txt` until used).
+Send the code + your server URL to a friend.
+
+### Run a node (what you send to friends)
+
+```sh
+cargo build --release -p crawler-node   # ship target/release/crawler-node
+crawler-node --server http://your-host:8420
+```
+
+First run asks for the invite code, a node name, and their Riot API key
+(from <https://developer.riotgames.com>), then saves
+`~/.config/crawler-node/config.json` (token + key, chmod 600). After that,
+plain `crawler-node` resumes. Dev keys expire daily: on a 401/403 the node
+pauses and `crawler-node set-key` (or editing the config) resumes it
+within ~15 s. The key never leaves their machine — the server only ever
+sees fetched bodies.
+
+### Backfill
+
+```sh
+cargo run --release -p crawler-server -- backfill
 ```
 
 `backfill` reschedules every queued cohort member to *now* as a **deep
@@ -33,10 +93,11 @@ budget) or to heal coverage holes from the pre-paging era.
 
 ## Enabling more regions
 
-Edit `ENABLED_REGIONS` in `src/config.rs` — all 15 platforms are already
-declared in `ALL_REGIONS`. Rate limiters are keyed by routing host, so
-platforms sharing a host (EUW1+EUN1 → `europe`) automatically share that
-host's budget when both are enabled.
+Edit `ENABLED_REGIONS` in `crates/server/src/config.rs` — all 15 platforms
+are already declared in `ALL_REGIONS`. Each node's rate limiters are keyed
+by routing host, so platforms sharing a host (EUW1+EUN1 → `europe`) split
+that host's budget, while **every additional node multiplies the budget of
+every host** — with several nodes it pays to enable more regions.
 
 ## How it works — apex cohort strategy
 
@@ -132,8 +193,9 @@ raw/EUW1/<id>.*.json.zst       1% raw API JSON sample for regression tests
 
 Segment block: `magic u32 | crc32(compressed) u32 | compressed_len u32 |
 uncompressed_len u32 | zstd bytes`; inside, each record is `len u32 | protobuf`.
-Torn tails are truncated on restart. Wire schema: `matchrecord.proto`
-(hand-mirrored by `src/record.rs`; participant stats are a varint array in
+Torn tails are truncated on restart. Wire schema:
+`crates/server/matchrecord.proto` (hand-mirrored by
+`crates/server/src/record.rs`; participant stats are a varint array in
 `STAT_FIELDS_V1` order — append-only, bump `SCHEMA_VERSION` when adding).
 
 Durability: hot-path redb transactions (per-match state, frontier ops, id
@@ -147,15 +209,16 @@ reconciliation pass.
 
 ## Rate limiting
 
-Two limiter layers, mirroring Riot's enforcement: an *app* limiter per
-routing host and a *method* limiter per (host, endpoint). Both start from
-the dev-key defaults in `src/config.rs` (20 req/1 s + 100 req/2 min) and
-adopt the live windows from `X-App-Rate-Limit` / `X-Method-Rate-Limit`
-response headers, so a production key applies with no config change. 429
-cooldowns honor `Retry-After` and are scoped by `X-Rate-Limit-Type` to the
-offending layer. Dev-key sustained ceiling is ~0.83 req/s per host: expect
-**~40–50 matches/hr stored** without timelines (half that with
-`FETCH_TIMELINES` on).
+Rate limiting lives entirely **node-side** (`crates/node/src/ratelimit.rs`),
+since limits are per API key. Two limiter layers, mirroring Riot's
+enforcement: an *app* limiter per routing host and a *method* limiter per
+(host, endpoint). Both start from the dev-key defaults (20 req/1 s +
+100 req/2 min) and adopt the live windows from `X-App-Rate-Limit` /
+`X-Method-Rate-Limit` response headers, so a production key applies with
+no config change. 429 cooldowns honor `Retry-After` and are scoped by
+`X-Rate-Limit-Type` to the offending layer. Dev-key sustained ceiling is
+~0.83 req/s per host *per node*: expect **~40–50 matches/hr stored per
+node** without timelines (half that with `FETCH_TIMELINES` on).
 
 ## Not in the MVP (by design)
 

@@ -48,6 +48,8 @@ const T_OUTSIDER: TableDefinition<u32, u32> = TableDefinition::new("outsider_see
 /// (platform, game_id) -> 11 bytes: per-participant stored-predecessor count
 /// (capped at HISTORY_REQUIRED) x10 + valid flag
 const T_PROGRESS: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("sample_progress");
+/// node_id -> postcard NodeRec (enrolled crawler nodes; tokens stored hashed)
+const T_NODES: TableDefinition<u32, &[u8]> = TableDefinition::new("nodes");
 
 pub const BUCKET_PRIORITY: u8 = 0; // cohort members
 pub const BUCKET_OTHER: u8 = 1; // legacy; drained and dropped
@@ -55,6 +57,15 @@ pub const BUCKET_OTHER: u8 = 1; // legacy; drained and dropped
 pub const COHORT_SRC_APEX: u8 = 0;
 pub const COHORT_SRC_ADOPTED: u8 = 1;
 pub const COHORT_SRC_LADDER: u8 = 2;
+
+/// An enrolled crawler node. The bearer token itself is never stored —
+/// only its sha256, so a leaked state.redb can't impersonate nodes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeRec {
+    pub name: String,
+    pub token_sha256_hex: String,
+    pub created_ms: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RankSnap {
@@ -316,6 +327,7 @@ impl Store {
             txn.open_table(T_COHORT)?;
             txn.open_table(T_OUTSIDER)?;
             txn.open_table(T_PROGRESS)?;
+            txn.open_table(T_NODES)?;
         }
         txn.commit()?;
 
@@ -727,6 +739,40 @@ impl Store {
             .collect();
         v.sort();
         v
+    }
+
+    // ---- crawler nodes ----
+
+    /// All enrolled nodes, for loading the runtime registry at startup.
+    pub fn nodes_all(&self) -> Result<Vec<(u32, NodeRec)>> {
+        let txn = self.db.begin_read()?;
+        let t = txn.open_table(T_NODES)?;
+        let mut out = Vec::new();
+        for kv in t.iter()? {
+            let (k, v) = kv?;
+            out.push((k.value(), postcard::from_bytes(v.value())?));
+        }
+        Ok(out)
+    }
+
+    /// Persists a freshly enrolled node (durable immediately — enrollment
+    /// is rare and losing a friend's token to a crash would be rude).
+    pub fn node_add(&mut self, name: &str, token_sha256_hex: &str, now_ms: u64) -> Result<u32> {
+        let id = self.meta_get_u32("next_node_id")?.unwrap_or(1);
+        let rec = NodeRec {
+            name: name.to_string(),
+            token_sha256_hex: token_sha256_hex.to_string(),
+            created_ms: now_ms,
+        };
+        let txn = self.db.begin_write()?; // Durability::Immediate
+        {
+            let mut t = txn.open_table(T_NODES)?;
+            t.insert(id, postcard::to_allocvec(&rec)?.as_slice())?;
+            let mut t_meta = txn.open_table(T_META)?;
+            t_meta.insert("next_node_id", (id + 1).to_le_bytes().as_slice())?;
+        }
+        txn.commit()?;
+        Ok(id)
     }
 
     // ---- frontier ----

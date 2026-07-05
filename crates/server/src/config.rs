@@ -39,10 +39,12 @@ pub const ALL_REGIONS: &[Region] = &[
 /// EUW1) only splits that host's budget.
 pub const ENABLED_REGIONS: &[&str] = &["EUW1", "NA1", "KR", "VN2"];
 
-/// Matches fetched concurrently per player visit (each = 2 regional-host
-/// requests in flight). Keeps the 20 req/1s burst window busy instead of
-/// serializing on network latency; the limiter still enforces the budget.
-pub const MATCH_FETCH_CONCURRENCY: usize = 8;
+/// Matches fetched concurrently per player visit. This bounds how deep the
+/// broker's job queue gets per region, so it must cover the whole fleet:
+/// with N nodes each holding up to `broker::TARGET_INFLIGHT_PER_HOST` jobs
+/// per host, keep this >= N * that target or nodes idle. Node-side rate
+/// limiters still enforce every key's real budget.
+pub const MATCH_FETCH_CONCURRENCY: usize = 32;
 
 pub fn enabled_regions() -> Vec<Region> {
     ALL_REGIONS
@@ -52,12 +54,28 @@ pub fn enabled_regions() -> Vec<Region> {
         .collect()
 }
 
-// ---- Rate limits ----
-/// Initial app-limit windows per routing host: (requests, window_ms).
-/// These are the dev-key defaults; the limiter adopts the live values from
-/// `X-App-Rate-Limit` / `X-Method-Rate-Limit` response headers after the
-/// first response on each host, so a production key needs no edit here.
-pub const RL_DEFAULT_WINDOWS: &[(u32, u64)] = &[(20, 1_000), (100, 120_000)];
+// ---- Node fleet ----
+/// A job handed to a node must be answered within this window or it is
+/// re-issued to another node (hard requirement: 2.5 min max).
+pub const LEASE_MS: u64 = 150_000;
+
+/// Fraction of dispatched jobs (percent) duplicated to a second node to
+/// cross-check results, catching nodes that return wrong data. Override
+/// with env `CRAWLER_AUDIT_DUP_PERCENT`.
+pub const AUDIT_DUP_PERCENT_DEFAULT: f64 = 1.0;
+
+pub fn audit_dup_percent() -> f64 {
+    std::env::var("CRAWLER_AUDIT_DUP_PERCENT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| (0.0..=100.0).contains(v))
+        .unwrap_or(AUDIT_DUP_PERCENT_DEFAULT)
+}
+
+/// HTTP bind address for the node API; override with env `CRAWLER_BIND`.
+pub fn bind_addr() -> String {
+    std::env::var("CRAWLER_BIND").unwrap_or_else(|_| "0.0.0.0:8420".to_string())
+}
 
 // ---- Queues ----
 /// Solo queue only for the MVP; matchlist requests filter on this.

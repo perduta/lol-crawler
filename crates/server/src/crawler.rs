@@ -95,7 +95,16 @@ impl RegionCrawler {
         let mut matches_stored = 0u64;
 
         while !self.stopped() {
-            self.maybe_seed().await?;
+            // Seed failures (e.g. every node offline long enough to abandon
+            // the job) must not kill the region loop; retry next pass.
+            if let Err(e) = self.maybe_seed().await {
+                if self.stopped() {
+                    break;
+                }
+                tracing::warn!(platform = self.region.platform, error = %e, "seed failed; will retry");
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                continue;
+            }
 
             let task = {
                 let mut store = self.store.lock().await;
@@ -132,7 +141,17 @@ impl RegionCrawler {
                     }
                 }
                 None => {
-                    let expanded = self.maybe_expand().await?;
+                    let expanded = match self.maybe_expand().await {
+                        Ok(x) => x,
+                        Err(e) => {
+                            if self.stopped() {
+                                break;
+                            }
+                            tracing::warn!(platform = self.region.platform, error = %e,
+                                "expansion failed; will retry");
+                            false
+                        }
+                    };
                     if !expanded {
                         let next_due = {
                             let store = self.store.lock().await;

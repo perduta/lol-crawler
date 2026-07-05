@@ -15,7 +15,11 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
-use crate::config;
+/// Initial app-limit windows: the dev-key defaults (20 req/1s +
+/// 100 req/2min). The limiter adopts the live values from
+/// `X-App-Rate-Limit` / `X-Method-Rate-Limit` response headers after the
+/// first response on each host, so a production key needs no edit here.
+const RL_DEFAULT_WINDOWS: &[(u32, u64)] = &[(20, 1_000), (100, 120_000)];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowSpec {
@@ -24,7 +28,7 @@ pub struct WindowSpec {
 }
 
 fn default_specs() -> Vec<WindowSpec> {
-    config::RL_DEFAULT_WINDOWS
+    RL_DEFAULT_WINDOWS
         .iter()
         .map(|&(limit, window_ms)| WindowSpec { limit, window_ms })
         .collect()
@@ -163,7 +167,7 @@ impl RateLimiter {
 #[derive(Default)]
 pub struct LimiterRegistry {
     app: std::sync::Mutex<HashMap<String, Arc<RateLimiter>>>,
-    method: std::sync::Mutex<HashMap<(String, &'static str), Arc<RateLimiter>>>,
+    method: std::sync::Mutex<HashMap<(String, String), Arc<RateLimiter>>>,
 }
 
 impl LimiterRegistry {
@@ -174,9 +178,9 @@ impl LimiterRegistry {
             .clone()
     }
 
-    pub fn method(&self, host: &str, method: &'static str) -> Arc<RateLimiter> {
+    pub fn method(&self, host: &str, method: &str) -> Arc<RateLimiter> {
         let mut map = self.method.lock().unwrap();
-        map.entry((host.to_string(), method))
+        map.entry((host.to_string(), method.to_string()))
             .or_insert_with(|| {
                 Arc::new(RateLimiter::new(&format!("{host}/{method}"), default_specs()))
             })

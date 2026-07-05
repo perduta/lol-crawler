@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::broker::Broker;
 use crate::config::Region;
-use crate::ratelimit::LimiterRegistry;
+use crate::registry::Registry;
 
 #[derive(Default)]
 pub struct Metrics {
@@ -41,10 +42,12 @@ impl Metrics {
 }
 
 /// Prints, every 60 s: games stored per region in that window (+ running
-/// totals), full-history sample counts, and requests sent per routing host.
+/// totals), full-history sample counts, per-node request counts / audit
+/// verdicts / key state, and broker queue depth.
 pub async fn reporter(
     metrics: Arc<Metrics>,
-    limiters: Arc<LimiterRegistry>,
+    registry: Arc<Registry>,
+    broker: Arc<Broker>,
     store: Arc<tokio::sync::Mutex<crate::storage::Store>>,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -82,18 +85,40 @@ pub async fn reporter(
                 .join("  ")
         };
 
-        let reqs_line = limiters
-            .sent_totals()
-            .into_iter()
-            .map(|(h, total)| {
-                let prev = prev_reqs.insert(h.clone(), total).unwrap_or(0);
-                format!("{h}=+{}", total - prev)
-            })
-            .collect::<Vec<_>>()
-            .join("  ");
+        let nodes_line = {
+            let reports = registry.report();
+            if reports.is_empty() {
+                "none enrolled".to_string()
+            } else {
+                reports
+                    .into_iter()
+                    .map(|r| {
+                        let prev = prev_reqs.insert(r.name.clone(), r.completed).unwrap_or(0);
+                        let mut s = format!("{}=+{}", r.name, r.completed - prev);
+                        if r.audits_pass + r.audits_soft_fail + r.audits_hard_fail > 0 {
+                            s.push_str(&format!(
+                                " audits:{}ok/{}soft/{}FAIL",
+                                r.audits_pass, r.audits_soft_fail, r.audits_hard_fail
+                            ));
+                        }
+                        if r.key_bad {
+                            s.push_str(" KEY-BAD");
+                        }
+                        match r.idle_secs {
+                            Some(i) if i > 120 => s.push_str(&format!(" idle:{}m", i / 60)),
+                            None => s.push_str(" offline"),
+                            _ => {}
+                        }
+                        s
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            }
+        };
+        let (queued, leased) = broker.depth();
 
         tracing::info!(
-            "[window {window:02}] games/60s: {games_line} | valid samples: {valid_line} | req/60s: {reqs_line}"
+            "[window {window:02}] games/60s: {games_line} | valid samples: {valid_line} | nodes: {nodes_line} | jobs: {queued} queued, {leased} leased"
         );
     }
 }

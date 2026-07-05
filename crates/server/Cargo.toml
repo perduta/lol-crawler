@@ -1,0 +1,28 @@
+[package]
+name = "crawler-server"
+version = "0.2.0"
+edition = "2024"
+
+[[bin]]
+name = "crawler-server"
+path = "src/main.rs"
+
+[dependencies]
+crawler-proto = { path = "../proto" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "net"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+prost = "0.13"
+zstd = "0.13"
+roaring = "0.10"
+redb = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+crc32fast = "1"
+chrono = "0.4"
+futures = "0.3"
+postcard = { version = "1", features = ["alloc"] }
+rand = "0.9"
+sha2 = "0.10"
