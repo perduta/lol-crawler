@@ -1,0 +1,79 @@
+// Reference schema for the MatchRecord wire format.
+//
+// The crawler encodes with hand-derived prost structs in src/record.rs;
+// this file is the language-neutral mirror (keep the two in sync). Any
+// protobuf implementation can decode segment records with this schema.
+//
+// Participant.stats holds values for the field list pinned by
+// schema_version — see STAT_FIELDS_V1 in src/record.rs. Append-only.
+
+syntax = "proto3";
+
+package lolcrawler;
+
+message MatchRecord {
+  uint32 schema_version = 1;
+  uint64 game_id = 2;        // numeric part of "EUW1_123..."; platform is the shard
+  string platform = 3;
+  uint32 queue_id = 4;
+  int64 game_start_ms = 5;
+  uint32 duration_s = 6;
+  bool blue_won = 7;
+  string game_version = 8;
+  uint32 patch_major = 9;
+  uint32 patch_minor = 10;
+  repeated Participant participants = 11; // exactly 10: blue TOP..UTILITY, then red
+  TimelineLite timeline = 12;
+  repeated uint32 bans = 13; // 10 champion ids, 0 = no ban
+}
+
+message Participant {
+  uint32 player_id = 1; // dictionary-encoded puuid (players table in state.redb)
+  uint32 champion_id = 2;
+  uint32 position = 3;  // 0..4 = TOP, JUNGLE, MIDDLE, BOTTOM, UTILITY
+  uint32 spell1 = 4;
+  uint32 spell2 = 5;
+  repeated uint32 runes = 6;  // [primaryStyle, subStyle, perk x6, statPerk x3]
+  repeated sint64 stats = 7;  // STAT_FIELDS values, schema_version order
+}
+
+message TimelineLite {
+  repeated MinuteFrame frames = 1;
+  repeated KillEvent kills = 2;
+  repeated ObjectiveEvent objectives = 3;
+  repeated WardEvent wards = 4;
+}
+
+message MinuteFrame {
+  uint32 minute = 1;
+  repeated uint32 total_gold = 2;    // 10 entries, participant order
+  repeated uint32 xp = 3;
+  repeated uint32 cs = 4;            // minions + jungle
+  repeated uint32 dmg_to_champs = 5;
+}
+
+// Participant indices are 0..9; 255 = none/unknown (e.g. minion execute).
+message KillEvent {
+  uint32 t_s = 1;
+  uint32 killer = 2;
+  uint32 victim = 3;
+  uint32 assist_mask = 4; // bit i = participant i assisted
+  uint32 x = 5;
+  uint32 y = 6;
+}
+
+message ObjectiveEvent {
+  uint32 t_s = 1;
+  // 1=dragon 2=herald 3=baron 4=voidgrubs 5=elder 6=atakhan
+  // 7=tower 8=inhibitor 9=plate 20=other monster 21=other building
+  uint32 kind = 2;
+  uint32 killer = 3;      // 0..9, 255 = none
+  uint32 losing_team = 4; // buildings/plates: team that lost it (100/200)
+  uint32 lane = 5;        // 0=none 1=top 2=mid 3=bot
+}
+
+message WardEvent {
+  uint32 t_s = 1;
+  uint32 kind = 2;        // 1=placed 2=killed
+  uint32 participant = 3; // creator/killer
+}

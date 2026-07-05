@@ -1,0 +1,24 @@
+[package]
+name = "lol-crawler"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+prost = "0.13"
+zstd = "0.13"
+roaring = "0.10"
+redb = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+crc32fast = "1"
+chrono = "0.4"
+futures = "0.3"
+postcard = { version = "1", features = ["alloc"] }
+
+[profile.release]
+lto = true
