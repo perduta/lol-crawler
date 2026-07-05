@@ -1,3 +1,6 @@
+### Disclaimer
+Entire project is vibe coded and **SHOULD NOT BE CONSIDERED PRODUCTION READY**, but I've decided to push it anyway, maybe someone will find any use to it.
+
 # lol-crawler
 
 A distributed crawler for the Riot Games API that collects League of Legends
