@@ -130,7 +130,7 @@ pub const BRAKE_OFF_COUNT: u64 = 100;
 /// match to count as a full-history training sample.
 pub const HISTORY_REQUIRED: u8 = 20;
 
-// ---- Frontier scheduling (mirrors the old ComputeExpiracyDays heuristic) ----
+// ---- Frontier scheduling (activity-based revisit heuristic) ----
 pub const MIN_REVISIT_DAYS: f64 = 7.0;
 pub const MAX_REVISIT_DAYS: f64 = 60.0;
 pub const REVISIT_AFTER_MATCHES: f64 = 4.0;

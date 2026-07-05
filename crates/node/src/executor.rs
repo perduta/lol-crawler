@@ -1,7 +1,7 @@
 //! Executes one opaque job against the Riot API with the node's own key:
 //! rate-limited, retrying per class of error, adopting server-declared
-//! limit windows from response headers. This is the old crawler's `get()`
-//! core, generalized — the node never interprets what it fetches.
+//! limit windows from response headers. The node never interprets what it
+//! fetches.
 
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};

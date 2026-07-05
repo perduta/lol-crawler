@@ -2,6 +2,9 @@
 name = "crawler-node"
 version = "0.1.0"
 edition = "2024"
+description = "Node core library and CLI: executes Riot API jobs with the operator's own key"
+license.workspace = true
+authors.workspace = true
 
 [lib]
 name = "crawler_node"

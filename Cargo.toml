@@ -2,5 +2,9 @@
 resolver = "2"
 members = ["crates/proto", "crates/server", "crates/node", "crates/desktop"]
 
+[workspace.package]
+license = "MIT OR Apache-2.0"
+authors = ["Patryk Perduta"]
+
 [profile.release]
 lto = true

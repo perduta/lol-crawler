@@ -2,6 +2,9 @@
 name = "crawler-server"
 version = "0.2.0"
 edition = "2024"
+description = "Crawl server: owns crawl strategy and storage, dispatches Riot API jobs to nodes"
+license.workspace = true
+authors.workspace = true
 
 [[bin]]
 name = "crawler-server"

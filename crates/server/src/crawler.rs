@@ -461,7 +461,7 @@ impl RegionCrawler {
             return Ok(stored);
         }
 
-        // Reschedule by activity (port of the old ComputeExpiracyDays).
+        // Reschedule by activity.
         let days_passed = if task.last_visit_ms <= DEEP_VISIT_MS {
             14.0
         } else {

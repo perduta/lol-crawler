@@ -2,6 +2,9 @@
 name = "crawler-proto"
 version = "0.1.0"
 edition = "2024"
+description = "JSON wire protocol shared by the crawl server and nodes"
+license.workspace = true
+authors.workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

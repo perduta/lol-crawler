@@ -344,7 +344,7 @@ pub fn parse_match(match_json: &str, timeline_json: Option<&str>) -> Result<Pars
         .unwrap_or_default();
 
     // Order participants blue-then-red, TOP..UTILITY within each team,
-    // repairing missing teamPosition into the unused slot (as the old crawler did).
+    // repairing missing teamPosition into the unused slot.
     let mut ordered: Vec<(usize, &Value)> = Vec::with_capacity(10);
     for team in 0..2 {
         let members = &participants_json[team * 5..(team + 1) * 5];
