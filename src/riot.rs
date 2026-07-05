@@ -7,7 +7,11 @@ use anyhow::{Result, bail};
 use serde::Deserialize;
 
 use crate::config::{self, Region};
-use crate::ratelimit::{LimiterRegistry, RateLimiter};
+use crate::ratelimit::{LimiterRegistry, parse_limit_header};
+
+fn header<'a>(r: &'a reqwest::Response, name: &str) -> Option<&'a str> {
+    r.headers().get(name).and_then(|v| v.to_str().ok())
+}
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -63,17 +67,17 @@ impl RiotClient {
         Self { http, api_key, limiters }
     }
 
-    fn limiter(&self, host: &str) -> Arc<RateLimiter> {
-        self.limiters.get(host)
-    }
-
-    async fn get(&self, host: &str, path_and_query: &str) -> Result<GetResult> {
+    async fn get(&self, host: &str, method: &'static str, path_and_query: &str) -> Result<GetResult> {
         let url = format!("https://{host}.api.riotgames.com{path_and_query}");
-        let limiter = self.limiter(host);
+        // Method limiter first: waiting on a tight method budget must not
+        // consume app-budget slots that other endpoints could use.
+        let method_limiter = self.limiters.method(host, method);
+        let app_limiter = self.limiters.app(host);
         let mut attempts = 0u32;
         loop {
             attempts += 1;
-            limiter.acquire().await;
+            method_limiter.acquire().await;
+            app_limiter.acquire().await;
             let resp = self
                 .http
                 .get(&url)
@@ -82,6 +86,14 @@ impl RiotClient {
                 .await;
             match resp {
                 Ok(r) => {
+                    // Adopt the server-declared limit windows (a production
+                    // key's budgets apply with no config change).
+                    if let Some(h) = header(&r, "X-App-Rate-Limit") {
+                        app_limiter.update_specs(parse_limit_header(h)).await;
+                    }
+                    if let Some(h) = header(&r, "X-Method-Rate-Limit") {
+                        method_limiter.update_specs(parse_limit_header(h)).await;
+                    }
                     let status = r.status();
                     if status.is_success() {
                         return Ok(GetResult::Body(r.text().await?));
@@ -89,13 +101,15 @@ impl RiotClient {
                     match status.as_u16() {
                         404 => return Ok(GetResult::NotFound),
                         429 => {
-                            let retry_after = r
-                                .headers()
-                                .get("Retry-After")
-                                .and_then(|v| v.to_str().ok())
+                            let retry_after = header(&r, "Retry-After")
                                 .and_then(|v| v.parse::<u64>().ok())
                                 .unwrap_or(10);
-                            limiter.cooldown(retry_after).await;
+                            // Scope the cooldown to the layer that tripped.
+                            if header(&r, "X-Rate-Limit-Type") == Some("method") {
+                                method_limiter.cooldown(retry_after).await;
+                            } else {
+                                app_limiter.cooldown(retry_after).await;
+                            }
                             // 429 doesn't count against attempts; the budget is the fix.
                             attempts -= 1;
                         }
@@ -135,9 +149,10 @@ impl RiotClient {
     async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         host: &str,
+        method: &'static str,
         path: &str,
     ) -> Result<Option<T>> {
-        match self.get(host, path).await? {
+        match self.get(host, method, path).await? {
             GetResult::Body(body) => Ok(Some(serde_json::from_str(&body)?)),
             GetResult::NotFound => Ok(None),
         }
@@ -148,7 +163,7 @@ impl RiotClient {
     pub async fn apex_league(&self, region: Region, league: &str) -> Result<LeagueList> {
         let path = format!("/lol/league/v4/{league}/by-queue/{}", config::RANKED_QUEUE_TYPE);
         Ok(self
-            .get_json(region.platform_host, &path)
+            .get_json(region.platform_host, "league-v4.apex", &path)
             .await?
             .unwrap_or(LeagueList { entries: Vec::new() }))
     }
@@ -166,7 +181,7 @@ impl RiotClient {
             config::RANKED_QUEUE_TYPE
         );
         Ok(self
-            .get_json(region.platform_host, &path)
+            .get_json(region.platform_host, "league-v4.entries", &path)
             .await?
             .unwrap_or_default())
     }
@@ -179,19 +194,30 @@ impl RiotClient {
     ) -> Result<Vec<LeagueEntry>> {
         let path = format!("/lol/league/v4/entries/by-puuid/{puuid}");
         Ok(self
-            .get_json(region.platform_host, &path)
+            .get_json(region.platform_host, "league-v4.by-puuid", &path)
             .await?
             .unwrap_or_default())
     }
 
-    /// Ranked matchlist for a player (regional host), newest first.
-    pub async fn match_ids(&self, region: Region, puuid: &str, start_time_s: i64) -> Result<Vec<String>> {
-        let path = format!(
-            "/lol/match/v5/matches/by-puuid/{puuid}/ids?queue={}&start=0&count=100&startTime={start_time_s}",
+    /// One page (up to 100 ids) of a player's ranked matchlist (regional
+    /// host), newest first. `start_time_s: None` = no age cutoff (deep
+    /// backfill walks the full history the API still has).
+    pub async fn match_ids_page(
+        &self,
+        region: Region,
+        puuid: &str,
+        start_time_s: Option<i64>,
+        start: u32,
+    ) -> Result<Vec<String>> {
+        let mut path = format!(
+            "/lol/match/v5/matches/by-puuid/{puuid}/ids?queue={}&start={start}&count=100",
             config::QUEUE_ID
         );
+        if let Some(t) = start_time_s {
+            path.push_str(&format!("&startTime={t}"));
+        }
         Ok(self
-            .get_json(region.regional_host, &path)
+            .get_json(region.regional_host, "match-v5.ids", &path)
             .await?
             .unwrap_or_default())
     }
@@ -199,7 +225,7 @@ impl RiotClient {
     /// Full match JSON (regional host). None if the API 404s.
     pub async fn match_raw(&self, region: Region, match_id: &str) -> Result<Option<String>> {
         let path = format!("/lol/match/v5/matches/{match_id}");
-        match self.get(region.regional_host, &path).await? {
+        match self.get(region.regional_host, "match-v5.match", &path).await? {
             GetResult::Body(b) => Ok(Some(b)),
             GetResult::NotFound => Ok(None),
         }
@@ -208,7 +234,7 @@ impl RiotClient {
     /// Full timeline JSON (regional host). None if the API 404s.
     pub async fn timeline_raw(&self, region: Region, match_id: &str) -> Result<Option<String>> {
         let path = format!("/lol/match/v5/matches/{match_id}/timeline");
-        match self.get(region.regional_host, &path).await? {
+        match self.get(region.regional_host, "match-v5.timeline", &path).await? {
             GetResult::Body(b) => Ok(Some(b)),
             GetResult::NotFound => Ok(None),
         }

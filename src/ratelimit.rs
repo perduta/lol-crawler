@@ -1,7 +1,13 @@
-//! Sliding-window rate limiter, one instance per routing host.
+//! Sliding-window rate limiters, mirroring Riot's two enforcement layers:
 //!
-//! Enforces both dev-key windows (20 req / 1 s and 100 req / 2 min) and a
-//! shared cooldown that 429 responses (Retry-After) push out.
+//!  - one *app* limiter per routing host (all endpoints share its budget);
+//!  - one *method* limiter per (host, endpoint method).
+//!
+//! Both start from the conservative dev-key defaults in `config` and adopt
+//! the server-declared windows from the `X-App-Rate-Limit` /
+//! `X-Method-Rate-Limit` response headers as soon as one is seen, so a
+//! production key needs no config change. 429 cooldowns are scoped by
+//! `X-Rate-Limit-Type` to the offending layer.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -11,8 +17,35 @@ use tokio::sync::Mutex;
 
 use crate::config;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowSpec {
+    pub limit: u32,
+    pub window_ms: u64,
+}
+
+fn default_specs() -> Vec<WindowSpec> {
+    config::RL_DEFAULT_WINDOWS
+        .iter()
+        .map(|&(limit, window_ms)| WindowSpec { limit, window_ms })
+        .collect()
+}
+
+/// Parses a Riot rate-limit header, e.g. "20:1,100:120" = 20/1s + 100/120s.
+pub fn parse_limit_header(s: &str) -> Vec<WindowSpec> {
+    s.split(',')
+        .filter_map(|part| {
+            let (limit, secs) = part.trim().split_once(':')?;
+            Some(WindowSpec {
+                limit: limit.trim().parse().ok()?,
+                window_ms: secs.trim().parse::<u64>().ok()?.checked_mul(1000)?,
+            })
+        })
+        .collect()
+}
+
 struct Windows {
-    /// Send times of recent requests, pruned past the sustained window.
+    specs: Vec<WindowSpec>,
+    /// Send times of recent requests, pruned past the largest window.
     sent: VecDeque<Instant>,
     /// Do not send anything before this time (set on 429).
     cooldown_until: Option<Instant>,
@@ -20,15 +53,15 @@ struct Windows {
 
 pub struct RateLimiter {
     inner: Mutex<Windows>,
-    host: String,
+    key: String,
     sent_total: std::sync::atomic::AtomicU64,
 }
 
 impl RateLimiter {
-    pub fn new(host: &str) -> Self {
+    pub fn new(key: &str, specs: Vec<WindowSpec>) -> Self {
         Self {
-            inner: Mutex::new(Windows { sent: VecDeque::new(), cooldown_until: None }),
-            host: host.to_string(),
+            inner: Mutex::new(Windows { specs, sent: VecDeque::new(), cooldown_until: None }),
+            key: key.to_string(),
             sent_total: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -36,6 +69,18 @@ impl RateLimiter {
     /// Requests sent since process start.
     pub fn sent_total(&self) -> u64 {
         self.sent_total.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Replaces the limit windows with server-declared ones (no-op if equal).
+    pub async fn update_specs(&self, specs: Vec<WindowSpec>) {
+        if specs.is_empty() {
+            return;
+        }
+        let mut w = self.inner.lock().await;
+        if w.specs != specs {
+            tracing::info!(key = %self.key, ?specs, "rate limit windows updated from headers");
+            w.specs = specs;
+        }
     }
 
     /// Waits until a request may be sent, then reserves the slot.
@@ -56,27 +101,36 @@ impl RateLimiter {
                     None
                 }
                 .or_else(|| {
-                    let sustained = Duration::from_millis(config::RL_SUSTAINED_WINDOW_MS);
-                    let burst = Duration::from_millis(config::RL_BURST_WINDOW_MS);
+                    let max_window = Duration::from_millis(
+                        w.specs.iter().map(|s| s.window_ms).max().unwrap_or(0),
+                    );
                     while let Some(&front) = w.sent.front() {
-                        if now.duration_since(front) >= sustained {
+                        if now.duration_since(front) >= max_window {
                             w.sent.pop_front();
                         } else {
                             break;
                         }
                     }
-                    if w.sent.len() >= config::RL_SUSTAINED as usize {
-                        // Oldest entry leaving the 2-min window frees a slot.
-                        return Some(sustained - now.duration_since(*w.sent.front().unwrap()));
+                    let mut wait: Option<Duration> = None;
+                    for spec in &w.specs {
+                        let win = Duration::from_millis(spec.window_ms);
+                        let in_window = w
+                            .sent
+                            .iter()
+                            .rev()
+                            .take_while(|t| now.duration_since(**t) < win)
+                            .count();
+                        if in_window >= spec.limit as usize {
+                            // The limit-th newest send leaving the window frees a slot.
+                            let nth_newest = w.sent[w.sent.len() - spec.limit as usize];
+                            let d = win.saturating_sub(now.duration_since(nth_newest));
+                            wait = Some(wait.map_or(d, |cur| cur.max(d)));
+                        }
                     }
-                    let in_burst =
-                        w.sent.iter().rev().take_while(|t| now.duration_since(**t) < burst).count();
-                    if in_burst >= config::RL_BURST as usize {
-                        let nth_newest = w.sent[w.sent.len() - config::RL_BURST as usize];
-                        return Some(burst - now.duration_since(nth_newest));
+                    if wait.is_none() {
+                        w.sent.push_back(now);
                     }
-                    w.sent.push_back(now);
-                    None
+                    wait
                 })
             };
             match wait {
@@ -89,37 +143,69 @@ impl RateLimiter {
         }
     }
 
-    /// Called on 429: block the whole host for `secs`.
+    /// Called on 429: block this limiter for `secs`.
     pub async fn cooldown(&self, secs: u64) {
         let mut w = self.inner.lock().await;
         let until = Instant::now() + Duration::from_secs(secs);
         if w.cooldown_until.is_none_or(|u| u < until) {
             w.cooldown_until = Some(until);
         }
-        tracing::warn!(host = %self.host, secs, "rate limit cooldown");
+        tracing::warn!(key = %self.key, secs, "rate limit cooldown");
     }
 }
 
-/// Registry handing out one limiter per host, shared across regions.
+/// Registry handing out app limiters (per host) and method limiters
+/// (per host+method), shared across regions.
+///
+/// Method limiters start at the app defaults — never binding before the app
+/// limiter is — and tighten to the real per-method windows once the first
+/// `X-Method-Rate-Limit` header for that method arrives.
 #[derive(Default)]
 pub struct LimiterRegistry {
-    limiters: std::sync::Mutex<HashMap<String, Arc<RateLimiter>>>,
+    app: std::sync::Mutex<HashMap<String, Arc<RateLimiter>>>,
+    method: std::sync::Mutex<HashMap<(String, &'static str), Arc<RateLimiter>>>,
 }
 
 impl LimiterRegistry {
-    pub fn get(&self, host: &str) -> Arc<RateLimiter> {
-        let mut map = self.limiters.lock().unwrap();
+    pub fn app(&self, host: &str) -> Arc<RateLimiter> {
+        let mut map = self.app.lock().unwrap();
         map.entry(host.to_string())
-            .or_insert_with(|| Arc::new(RateLimiter::new(host)))
+            .or_insert_with(|| Arc::new(RateLimiter::new(host, default_specs())))
             .clone()
     }
 
-    /// (host, requests sent since start), sorted by host.
+    pub fn method(&self, host: &str, method: &'static str) -> Arc<RateLimiter> {
+        let mut map = self.method.lock().unwrap();
+        map.entry((host.to_string(), method))
+            .or_insert_with(|| {
+                Arc::new(RateLimiter::new(&format!("{host}/{method}"), default_specs()))
+            })
+            .clone()
+    }
+
+    /// (host, requests sent since start) from the app limiters, sorted by host.
     pub fn sent_totals(&self) -> Vec<(String, u64)> {
-        let map = self.limiters.lock().unwrap();
-        let mut v: Vec<_> =
-            map.iter().map(|(h, l)| (h.clone(), l.sent_total())).collect();
+        let map = self.app.lock().unwrap();
+        let mut v: Vec<_> = map.iter().map(|(h, l)| (h.clone(), l.sent_total())).collect();
         v.sort();
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_limit_headers() {
+        assert_eq!(
+            parse_limit_header("20:1,100:120"),
+            vec![
+                WindowSpec { limit: 20, window_ms: 1_000 },
+                WindowSpec { limit: 100, window_ms: 120_000 },
+            ]
+        );
+        assert_eq!(parse_limit_header("2000:10"), vec![WindowSpec { limit: 2000, window_ms: 10_000 }]);
+        assert!(parse_limit_header("garbage").is_empty());
     }
 }

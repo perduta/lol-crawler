@@ -52,16 +52,27 @@ pub fn enabled_regions() -> Vec<Region> {
         .collect()
 }
 
-// ---- Rate limits (per routing host, dev key) ----
-pub const RL_BURST: u32 = 20; // requests
-pub const RL_BURST_WINDOW_MS: u64 = 1_000;
-pub const RL_SUSTAINED: u32 = 100; // requests
-pub const RL_SUSTAINED_WINDOW_MS: u64 = 120_000;
+// ---- Rate limits ----
+/// Initial app-limit windows per routing host: (requests, window_ms).
+/// These are the dev-key defaults; the limiter adopts the live values from
+/// `X-App-Rate-Limit` / `X-Method-Rate-Limit` response headers after the
+/// first response on each host, so a production key needs no edit here.
+pub const RL_DEFAULT_WINDOWS: &[(u32, u64)] = &[(20, 1_000), (100, 120_000)];
 
 // ---- Queues ----
 /// Solo queue only for the MVP; matchlist requests filter on this.
 pub const QUEUE_ID: u32 = 420;
 pub const RANKED_QUEUE_TYPE: &str = "RANKED_SOLO_5x5";
+
+/// Also fetch the match timeline (a second regional request per match).
+/// The pre-game winner model doesn't use timeline data, and skipping it
+/// roughly doubles matches/day on the same budget.
+pub const FETCH_TIMELINES: bool = false;
+
+/// Matches shorter than this are remakes: archived in the segment log but
+/// they earn no history credit, no adoption credit, and never count as
+/// training samples.
+pub const REMAKE_MAX_DURATION_S: u32 = 300;
 
 // ---- Apex cohort strategy ----
 // Goal: maximize full-history training samples (all 10 participants with
@@ -117,4 +128,9 @@ pub const ZSTD_LEVEL: i32 = 7;
 pub const RAW_SAMPLE_PERMILLE: u64 = 10; // 1%
 
 /// Ignore matches older than this when walking a player's matchlist.
+/// (Deep backfill visits ignore this and walk the full history.)
 pub const MAX_MATCH_AGE_DAYS: i64 = 130;
+
+/// Hard cap on matchlist paging depth (ids per player per visit), a safety
+/// bound for deep backfill walks against API pathologies.
+pub const MATCHLIST_MAX_DEPTH: u32 = 10_000;

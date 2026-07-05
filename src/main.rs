@@ -52,13 +52,26 @@ async fn main() -> Result<()> {
     let data_dir =
         std::env::var("CRAWLER_DATA_DIR").unwrap_or_else(|_| config::DATA_DIR.to_string());
 
-    if std::env::args().nth(1).as_deref() == Some("inspect") {
-        return inspect::run(&data_dir);
+    let mut backfill = false;
+    match std::env::args().nth(1).as_deref() {
+        Some("inspect") => return inspect::run(&data_dir),
+        Some("backfill") => backfill = true,
+        Some(other) => anyhow::bail!("unknown command {other:?} (try: inspect | backfill)"),
+        None => {}
     }
 
     let api_key = load_api_key().context("loading API key")?;
 
-    let store = Arc::new(Mutex::new(Store::open(&data_dir)?));
+    let mut store = Store::open(&data_dir)?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as u64;
+    store.frontier_reconcile(now_ms)?;
+    if backfill {
+        let n = store.frontier_backfill_reset(now_ms)?;
+        tracing::info!(n, "backfill: cohort queued for deep full-history visits");
+    }
+    let store = Arc::new(Mutex::new(store));
     let limiters = Arc::new(LimiterRegistry::default());
     let client = Arc::new(RiotClient::new(api_key, limiters.clone()));
     let (stop_tx, stop_rx) = watch::channel(false);

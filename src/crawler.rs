@@ -10,6 +10,7 @@
 //! entries) are dropped without spending requests.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -21,7 +22,8 @@ use crate::metrics::Metrics;
 use crate::record;
 use crate::riot::RiotClient;
 use crate::storage::{
-    BUCKET_PRIORITY, COHORT_SRC_APEX, COHORT_SRC_LADDER, FrontierTask, RankSnap, Store,
+    BUCKET_PRIORITY, COHORT_SRC_APEX, COHORT_SRC_LADDER, DEEP_VISIT_MS, FrontierTask, RankSnap,
+    Store,
 };
 
 fn now_ms() -> u64 {
@@ -38,8 +40,12 @@ pub struct RegionCrawler {
     stop: watch::Receiver<bool>,
     metrics: Arc<Metrics>,
     /// Freshly adopted players, handed to the adoption worker for a rank
-    /// snapshot + frontier enqueue (platform-host budget).
+    /// snapshot (platform-host budget).
     adopt_tx: mpsc::UnboundedSender<(u32, String)>,
+    /// Budget brake state (hysteresis in [`Self::update_brake`]). While on,
+    /// all cohort growth pauses: seeding of lower apex leagues, ladder
+    /// expansion, and leak-driven adoption.
+    braked: AtomicBool,
 }
 
 impl RegionCrawler {
@@ -58,6 +64,7 @@ impl RegionCrawler {
             stop: stop.clone(),
             metrics,
             adopt_tx,
+            braked: AtomicBool::new(false),
         };
         let adoption_worker = AdoptionWorker {
             region,
@@ -86,10 +93,9 @@ impl RegionCrawler {
         tracing::info!(platform = self.region.platform, "crawler started");
         let mut last_commit = std::time::Instant::now();
         let mut matches_stored = 0u64;
-        let mut braked = false;
 
         while !self.stopped() {
-            self.maybe_seed(&mut braked).await?;
+            self.maybe_seed().await?;
 
             let task = {
                 let mut store = self.store.lock().await;
@@ -126,7 +132,7 @@ impl RegionCrawler {
                     }
                 }
                 None => {
-                    let expanded = self.maybe_expand(&mut braked).await?;
+                    let expanded = self.maybe_expand().await?;
                     if !expanded {
                         let next_due = {
                             let store = self.store.lock().await;
@@ -163,7 +169,8 @@ impl RegionCrawler {
 
     /// Recomputes the budget brake with hysteresis: on while the frontier
     /// backlog shows we can't even keep up with the current cohort.
-    async fn update_brake(&self, braked: &mut bool) -> Result<()> {
+    /// Returns the current state.
+    async fn update_brake(&self) -> Result<bool> {
         let overdue = {
             let store = self.store.lock().await;
             store.frontier_overdue_count(
@@ -173,14 +180,15 @@ impl RegionCrawler {
                 config::BRAKE_ON_COUNT * 2,
             )?
         };
-        if !*braked && overdue >= config::BRAKE_ON_COUNT {
-            *braked = true;
+        let braked = self.braked.load(Ordering::Relaxed);
+        if !braked && overdue >= config::BRAKE_ON_COUNT {
+            self.braked.store(true, Ordering::Relaxed);
             tracing::info!(platform = self.region.platform, overdue, "budget brake ON — cohort growth paused");
-        } else if *braked && overdue <= config::BRAKE_OFF_COUNT {
-            *braked = false;
+        } else if braked && overdue <= config::BRAKE_OFF_COUNT {
+            self.braked.store(false, Ordering::Relaxed);
             tracing::info!(platform = self.region.platform, overdue, "budget brake OFF — cohort growth resumed");
         }
-        Ok(())
+        Ok(self.braked.load(Ordering::Relaxed))
     }
 
     /// Registers a batch of league entries as cohort members: player ids,
@@ -213,7 +221,7 @@ impl RegionCrawler {
     /// Re-fetches the apex leagues on a cadence: 1 request per league,
     /// snapshots everyone's LP, enrolls new arrivals. Lower leagues are only
     /// pulled while the brake is off, so a saturated crawler stops widening.
-    async fn maybe_seed(&self, braked: &mut bool) -> Result<()> {
+    async fn maybe_seed(&self) -> Result<()> {
         // Key is versioned per strategy so stale timestamps from an older
         // seeding scheme can't suppress the first apex seed.
         let meta_key_ts = format!("seed_apex_{}", self.region.platform);
@@ -231,8 +239,7 @@ impl RegionCrawler {
             if self.stopped() {
                 return Ok(());
             }
-            self.update_brake(braked).await?;
-            if i > 0 && *braked {
+            if self.update_brake().await? && i > 0 {
                 tracing::info!(platform = self.region.platform, league, "seed skipped (braked)");
                 break;
             }
@@ -265,9 +272,8 @@ impl RegionCrawler {
 
     /// Ladder-band fallback expansion: one page per idle tick, only while
     /// the brake is off. Returns true if it enrolled anyone.
-    async fn maybe_expand(&self, braked: &mut bool) -> Result<bool> {
-        self.update_brake(braked).await?;
-        if *braked {
+    async fn maybe_expand(&self) -> Result<bool> {
+        if self.update_brake().await? {
             return Ok(false);
         }
         let cursor_key = format!("expand_cursor_{}", self.region.platform);
@@ -314,20 +320,57 @@ impl RegionCrawler {
         Ok(newly > 0)
     }
 
-    /// Fetches a player's matchlist and downloads every unseen match.
-    /// Returns the number of matches stored.
+    /// Fetches a player's matchlist (paged) and downloads every unseen
+    /// match. Deep visits (backfill) walk the entire history with no age
+    /// cutoff; normal visits use the age window and stop paging at the
+    /// first page containing an already-seen id. Returns matches stored.
     async fn process_player(&self, pid: u32, task: &FrontierTask) -> Result<u64> {
-        let start_time_s =
-            (now_ms() / 1000) as i64 - config::MAX_MATCH_AGE_DAYS * 24 * 3600;
+        // Keep the brake fresh even when the frontier is never idle:
+        // adoption gating (store_match) reads it on every stored match.
+        self.update_brake().await?;
 
-        // Matchlist (regional host) and rank refresh (platform host) hit
-        // different budgets — fetch them concurrently. The snapshot feeds
-        // as-of-time elo joins at materialization.
-        let (ids, rank_result) = tokio::join!(
-            self.client.match_ids(self.region, &task.puuid, start_time_s),
+        let deep = task.last_visit_ms == DEEP_VISIT_MS;
+        let start_time_s = (!deep)
+            .then(|| (now_ms() / 1000) as i64 - config::MAX_MATCH_AGE_DAYS * 24 * 3600);
+
+        // First matchlist page (regional host) and rank refresh (platform
+        // host) hit different budgets — fetch them concurrently. The
+        // snapshot feeds as-of-time elo joins at materialization.
+        let (first_page, rank_result) = tokio::join!(
+            self.client.match_ids_page(self.region, &task.puuid, start_time_s, 0),
             self.client.league_entries_by_puuid(self.region, &task.puuid),
         );
-        let ids = ids?;
+        let mut ids = first_page?;
+
+        // Page past the 100-id window. Deep visits walk to the end of the
+        // list; normal visits keep paging only while a full page has no
+        // already-seen id (i.e. >100 new games since the last visit —
+        // otherwise heavy grinders silently lose matches).
+        let mut page_len = ids.len();
+        let mut start = 100u32;
+        while page_len == 100 && start < config::MATCHLIST_MAX_DEPTH && !self.stopped() {
+            if !deep {
+                let store = self.store.lock().await;
+                let page = &ids[ids.len() - 100..];
+                let any_seen = page.iter().any(|id| {
+                    record::split_match_id(id)
+                        .is_ok_and(|(pf, num)| store.is_seen(pf, num))
+                });
+                if any_seen {
+                    break;
+                }
+            }
+            let page = self
+                .client
+                .match_ids_page(self.region, &task.puuid, start_time_s, start)
+                .await?;
+            page_len = page.len();
+            start += 100;
+            ids.extend(page);
+        }
+        // Concurrent games landing between page fetches can shift pages.
+        ids.sort();
+        ids.dedup();
 
         match rank_result {
             Ok(entries) => {
@@ -382,9 +425,25 @@ impl RegionCrawler {
             .fold(0u64, |acc, n| async move { acc + n })
             .await;
 
-        // Reschedule by activity (port of the old ComputeExpiracyDays).
         let now = now_ms();
-        let days_passed = if task.last_visit_ms == 0 {
+
+        // A deep visit cut short by shutdown keeps its deep marker so the
+        // next run resumes the full-history walk instead of falling back to
+        // the age-windowed fetch.
+        if deep && self.stopped() {
+            let mut store = self.store.lock().await;
+            store.frontier_push(
+                self.region.platform,
+                BUCKET_PRIORITY,
+                now,
+                pid,
+                &FrontierTask { puuid: task.puuid.clone(), last_visit_ms: DEEP_VISIT_MS },
+            )?;
+            return Ok(stored);
+        }
+
+        // Reschedule by activity (port of the old ComputeExpiracyDays).
+        let days_passed = if task.last_visit_ms <= DEEP_VISIT_MS {
             14.0
         } else {
             ((now - task.last_visit_ms) as f64 / 86_400_000.0).max(0.1)
@@ -425,14 +484,19 @@ impl RegionCrawler {
     async fn fetch_and_store_match(&self, match_id: &str, _current_pid: u32) -> Result<bool> {
         let (platform, game_id) = record::split_match_id(match_id)?;
 
-        // Match and timeline concurrently: the matchlist already filtered on
-        // queue, so a wasted timeline for a stray non-420 match is rare and
-        // cheaper than serializing every pair on latency.
-        let (match_json, timeline_json) = tokio::join!(
-            self.client.match_raw(self.region, match_id),
-            self.client.timeline_raw(self.region, match_id),
-        );
-        let (Some(match_json), timeline_json) = (match_json?, timeline_json?) else {
+        // Match and (optionally) timeline concurrently: the matchlist
+        // already filtered on queue, so a wasted timeline for a stray
+        // non-420 match is rare and cheaper than serializing on latency.
+        let (match_json, timeline_json) = if config::FETCH_TIMELINES {
+            let (m, t) = tokio::join!(
+                self.client.match_raw(self.region, match_id),
+                self.client.timeline_raw(self.region, match_id),
+            );
+            (m?, t?)
+        } else {
+            (self.client.match_raw(self.region, match_id).await?, None)
+        };
+        let Some(match_json) = match_json else {
             self.store.lock().await.mark_seen(platform, game_id);
             return Ok(false);
         };
@@ -453,16 +517,30 @@ impl RegionCrawler {
         }
         let mut rec = parsed.record;
 
+        let growth_paused = self.braked.load(Ordering::Relaxed);
         let mut store = self.store.lock().await;
         let ts_ms = rec.game_start_ms.max(0) as u64;
-        let outcome = store.store_match(&mut rec, &parsed.puuids, ts_ms)?;
+        let outcome = store.store_match(&mut rec, &parsed.puuids, ts_ms, growth_paused)?;
 
         if game_id % 1000 < config::RAW_SAMPLE_PERMILLE {
             store.save_raw_sample(platform, match_id, &match_json, timeline_json.as_deref())?;
         }
-        self.metrics.inc_games(platform);
 
-        // Newly adopted leak-players get a rank snapshot + frontier entry.
+        // Adopted players get their frontier entry here, under the same
+        // lock — the async worker only adds a best-effort rank snapshot, so
+        // a worker error or shutdown can never lose the player.
+        for (pid, puuid) in &outcome.adopted {
+            store.frontier_push(
+                self.region.platform,
+                BUCKET_PRIORITY,
+                now_ms(),
+                *pid,
+                &FrontierTask { puuid: puuid.clone(), last_visit_ms: 0 },
+            )?;
+        }
+        drop(store);
+
+        self.metrics.inc_games(platform);
         for (pid, puuid) in outcome.adopted {
             let _ = self.adopt_tx.send((pid, puuid));
         }
@@ -471,8 +549,8 @@ impl RegionCrawler {
 }
 
 /// Consumes freshly adopted players: snapshots their rank (platform-host
-/// budget, doesn't compete with match fetching) and enqueues their first
-/// crawl visit.
+/// budget, doesn't compete with match fetching). The frontier entry is
+/// already queued by the crawler, so failures here lose only a snapshot.
 struct AdoptionWorker {
     region: Region,
     client: Arc<RiotClient>,
@@ -501,12 +579,11 @@ impl AdoptionWorker {
             .iter()
             .find(|e| e.queue_type == config::RANKED_QUEUE_TYPE);
 
-        let mut store = self.store.lock().await;
-        let ts = now_ms();
         if let Some(e) = solo {
+            let mut store = self.store.lock().await;
             store.add_rank_snapshot(
                 pid,
-                ts,
+                now_ms(),
                 &RankSnap {
                     tier: e.tier.clone(),
                     division: e.rank.clone(),
@@ -516,13 +593,6 @@ impl AdoptionWorker {
                 },
             )?;
         }
-        store.frontier_push(
-            self.region.platform,
-            BUCKET_PRIORITY,
-            ts,
-            pid,
-            &FrontierTask { puuid: puuid.to_string(), last_visit_ms: 0 },
-        )?;
         Ok(())
     }
 }

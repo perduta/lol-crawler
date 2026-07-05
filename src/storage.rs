@@ -8,11 +8,13 @@
 //!   matches/{platform}/{date}.idx     (game_id u64, block_off u64, rec_off u32) LE per record
 //!   raw/{platform}/{match_id}.*.zst   1% raw JSON sample
 //!
-//! Durability ordering per commit: new players are committed to redb the
-//! moment ids are assigned (so segment records never reference unknown ids);
-//! then segment blocks are flushed+fsynced; then bitmaps/frontier/snapshots
-//! commit. A crash can only lose work that will be re-fetched, never corrupt
-//! the player mapping.
+//! Durability: hot-path redb transactions (per-match derived state,
+//! frontier ops, id assignment) commit *fast* (atomic, not fsynced) and are
+//! made durable by the periodic checkpoint in [`Store::commit`], which runs
+//! before any segment fsync. Ordering per commit: durable checkpoint, then
+//! segment flush+fsync, then seen-bitmaps. A crash can only lose work that
+//! will be re-fetched (re-stores are guarded by the progress record), never
+//! corrupt the player mapping or leave a bitmap claiming unflushed bytes.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -63,10 +65,16 @@ pub struct RankSnap {
     pub losses: i32,
 }
 
+/// Sentinel `last_visit_ms` value: this task is a *deep* visit — walk the
+/// player's entire matchlist (no age cutoff, full paging). Set by the
+/// `backfill` startup mode; survives restarts since it lives in the task.
+pub const DEEP_VISIT_MS: u64 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrontierTask {
     pub puuid: String,
-    /// Last time we walked this player's matchlist (0 = never).
+    /// Last time we walked this player's matchlist
+    /// (0 = never, [`DEEP_VISIT_MS`] = deep full-history visit requested).
     pub last_visit_ms: u64,
 }
 
@@ -115,16 +123,26 @@ impl SegmentWriter {
         Ok((seg, idx))
     }
 
-    fn append(&mut self, rec: &MatchRecord) -> Result<()> {
-        // Roll the file on date change so segments stay time-ordered.
+    /// True when the UTC date changed since this writer's files were opened.
+    /// The caller must then run a durable redb checkpoint and call [`roll`]:
+    /// rolling flushes buffered bytes, which may not hit disk before the
+    /// player ids they reference are durable.
+    fn needs_roll(&self) -> bool {
+        chrono::Utc::now().format("%Y-%m-%d").to_string() != self.date
+    }
+
+    /// Flushes the old day's buffer and switches to today's files.
+    fn roll(&mut self) -> Result<()> {
+        self.flush()?;
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        if today != self.date {
-            self.flush()?;
-            let (seg, idx) = Self::open_files(&self.dir, &today)?;
-            self.seg = seg;
-            self.idx = idx;
-            self.date = today;
-        }
+        let (seg, idx) = Self::open_files(&self.dir, &today)?;
+        self.seg = seg;
+        self.idx = idx;
+        self.date = today;
+        Ok(())
+    }
+
+    fn append(&mut self, rec: &MatchRecord) -> Result<()> {
         let off = self.buf.len() as u32;
         let bytes = rec.encode_to_vec();
         self.buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -372,9 +390,46 @@ impl Store {
         })
     }
 
+    // ---- transactions ----
+
+    /// Fast-path write transaction: atomic and ordered, but not fsynced.
+    /// Everything committed this way becomes durable at the next
+    /// [`Self::durable_checkpoint`]. A crash loses fast-path state and the
+    /// in-memory segment buffer *together*, which keeps them consistent:
+    /// lost matches are simply re-fetched.
+    fn begin_fast(&self) -> Result<redb::WriteTransaction> {
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(redb::Durability::None);
+        Ok(txn)
+    }
+
+    /// Durable (fsynced) redb commit: persists every fast-path transaction
+    /// since the last checkpoint, plus buffered rank snapshots. Must run
+    /// before any segment bytes are fsynced, so segments never reference
+    /// player ids a crash could take back.
+    fn durable_checkpoint(&mut self) -> Result<()> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let txn = self.db.begin_write()?; // Durability::Immediate (default)
+        {
+            // Always write something so the commit can't be elided.
+            let mut t_meta = txn.open_table(T_META)?;
+            t_meta.insert("checkpoint_ms", now_ms.to_le_bytes().as_slice())?;
+            let mut t_ranks = txn.open_table(T_RANKS)?;
+            for (pid, ts, val) in self.pending_ranks.drain(..) {
+                t_ranks.insert((pid, ts), val.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     // ---- players ----
 
-    /// Assigns ids to unknown puuids and durably commits them immediately.
+    /// Assigns ids to unknown puuids (committed fast-path; durable by the
+    /// time any segment referencing them is flushed).
     pub fn assign_player_ids(&mut self, puuids: &[String]) -> Result<Vec<u32>> {
         let mut new: Vec<(String, u32)> = Vec::new();
         let mut out = Vec::with_capacity(puuids.len());
@@ -392,7 +447,7 @@ impl Store {
             out.push(id);
         }
         if !new.is_empty() {
-            let txn = self.db.begin_write()?;
+            let txn = self.begin_fast()?;
             {
                 let mut t = txn.open_table(T_PLAYERS)?;
                 for (p, id) in &new {
@@ -420,18 +475,23 @@ impl Store {
     /// Stores a match end-to-end: assigns player ids (filling them into
     /// `rec`), counts/adopts outsiders, writes player-timeline entries,
     /// maintains the sample-progress tracker, then appends to the segment.
-    /// One durable redb transaction per match, committed *before* the record
-    /// enters the segment buffer, so segments never reference unknown ids.
+    /// One fast-path redb transaction per match, committed *before* the
+    /// record enters the segment buffer and made durable before any segment
+    /// flush, so flushed segments never reference unknown ids.
     ///
     /// Progress semantics: a participant slot counts *stored earlier games of
     /// that player* (capped at HISTORY_REQUIRED); "valid sample" = all 10
     /// slots full. This is a crawl-progress metric — the materializer does
     /// the exact last-20 check against real matchlist order.
+    /// `growth_paused` (the budget brake): outsider sightings still accrue,
+    /// but nobody crosses into the cohort while set — they convert on their
+    /// next sighting after the brake lifts.
     pub fn store_match(
         &mut self,
         rec: &mut MatchRecord,
         puuids: &[String],
         ts_ms: u64,
+        growth_paused: bool,
     ) -> Result<StoreMatchOutcome> {
         let platform = rec.platform.clone();
         let game_id = rec.game_id;
@@ -439,8 +499,24 @@ impl Store {
         let mut adopted: Vec<(u32, String)> = Vec::new();
         let mut newly_valid = 0u64;
 
+        // Re-store guard: a progress record (even an empty remake marker)
+        // means this match's derived state is already committed — a crash
+        // can lose the seen-bitmap and cause a re-fetch. Redo only the
+        // segment append (a possible duplicate record beats a hole; the
+        // materializer dedups by game id); never re-count history,
+        // adoption, or validity.
+        let already_stored = {
+            let rtxn = self.db.begin_read()?;
+            let t = rtxn.open_table(T_PROGRESS)?;
+            t.get((platform.as_str(), game_id))?.is_some()
+        };
+        // Remakes are archived but sample-irrelevant: no history credit, no
+        // adoption credit, never a valid sample. Their empty progress value
+        // doubles as the "stored" marker for the guard above.
+        let is_remake = rec.duration_s < config::REMAKE_MAX_DURATION_S;
+
         // ids from cache first; new ones get created inside the txn below.
-        let txn = self.db.begin_write()?;
+        let txn = self.begin_fast()?;
         {
             let mut t_players = txn.open_table(T_PLAYERS)?;
             let mut player_ids = Vec::with_capacity(10);
@@ -461,95 +537,107 @@ impl Store {
                 part.player_id = *pid;
             }
 
-            // Leak-driven adoption: outsiders seen often enough join the cohort.
-            let mut t_out = txn.open_table(T_OUTSIDER)?;
-            let mut t_coh = txn.open_table(T_COHORT)?;
-            for (pid, puuid) in player_ids.iter().zip(puuids) {
-                if self.cohort.contains(pid) {
-                    continue;
-                }
-                let count = self.outsider_seen.get(pid).copied().unwrap_or(0) + 1;
-                if count >= config::ADOPTION_THRESHOLD {
-                    self.outsider_seen.remove(pid);
-                    t_out.remove(*pid)?;
-                    self.cohort.insert(*pid);
-                    let val = postcard::to_allocvec(&(ts_ms, COHORT_SRC_ADOPTED))?;
-                    t_coh.insert(*pid, val.as_slice())?;
-                    adopted.push((*pid, puuid.clone()));
-                } else {
-                    self.outsider_seen.insert(*pid, count);
-                    t_out.insert(*pid, count)?;
-                }
-            }
-
-            let mut t_tl = txn.open_table(T_PLAYER_TL)?;
-            let mut t_prog = txn.open_table(T_PROGRESS)?;
-
-            // Predecessor counts (strictly before ts) for this match.
-            let mut progress = [0u8; 11];
-            for (i, pid) in player_ids.iter().enumerate() {
-                let mut c = 0u8;
-                for kv in t_tl.range((*pid, 0u64)..(*pid, ts_ms))?.rev() {
-                    kv?;
-                    c += 1;
-                    if c >= required {
-                        break;
+            if is_remake && !already_stored {
+                // Empty progress value = "stored, not sample-relevant".
+                let mut t_prog = txn.open_table(T_PROGRESS)?;
+                t_prog.insert((platform.as_str(), game_id), [0u8; 0].as_slice())?;
+            } else if !already_stored {
+                // Leak-driven adoption: outsiders seen often enough join the cohort.
+                let mut t_out = txn.open_table(T_OUTSIDER)?;
+                let mut t_coh = txn.open_table(T_COHORT)?;
+                for (pid, puuid) in player_ids.iter().zip(puuids) {
+                    if self.cohort.contains(pid) {
+                        continue;
+                    }
+                    let count = self.outsider_seen.get(pid).copied().unwrap_or(0) + 1;
+                    if !growth_paused && count >= config::ADOPTION_THRESHOLD {
+                        self.outsider_seen.remove(pid);
+                        t_out.remove(*pid)?;
+                        self.cohort.insert(*pid);
+                        let val = postcard::to_allocvec(&(ts_ms, COHORT_SRC_ADOPTED))?;
+                        t_coh.insert(*pid, val.as_slice())?;
+                        adopted.push((*pid, puuid.clone()));
+                    } else {
+                        self.outsider_seen.insert(*pid, count);
+                        t_out.insert(*pid, count)?;
                     }
                 }
-                progress[i] = c;
-            }
-            if progress[..10].iter().all(|c| *c >= required) {
-                progress[10] = 1;
-                newly_valid += 1;
-            }
-            t_prog.insert((platform.as_str(), game_id), progress.as_slice())?;
 
-            for (i, pid) in player_ids.iter().enumerate() {
-                let val = postcard::to_allocvec(&(game_id, i as u8))?;
-                t_tl.insert((*pid, ts_ms), val.as_slice())?;
-            }
+                let mut t_tl = txn.open_table(T_PLAYER_TL)?;
+                let mut t_prog = txn.open_table(T_PROGRESS)?;
 
-            // Retroactive: this match is now a stored predecessor for the
-            // player's later stored games. Counts are monotone in game time,
-            // so stop at the first later game already at the cap.
-            for pid in &player_ids {
-                for kv in t_tl.range((*pid, ts_ms + 1)..=(*pid, u64::MAX))? {
-                    let (_, v) = kv?;
-                    let (gid2, pos2): (u64, u8) = postcard::from_bytes(v.value())?;
-                    let key = (platform.as_str(), gid2);
-                    let Some(mut pr) = t_prog.get(key)?.and_then(|g| {
-                        <[u8; 11]>::try_from(g.value()).ok()
-                    }) else {
-                        continue; // legacy match without a progress record
-                    };
-                    let slot = pos2 as usize;
-                    if pr[slot] >= required {
-                        break;
+                // Predecessor counts (strictly before ts) for this match.
+                let mut progress = [0u8; 11];
+                for (i, pid) in player_ids.iter().enumerate() {
+                    let mut c = 0u8;
+                    for kv in t_tl.range((*pid, 0u64)..(*pid, ts_ms))?.rev() {
+                        kv?;
+                        c += 1;
+                        if c >= required {
+                            break;
+                        }
                     }
-                    pr[slot] += 1;
-                    if pr[10] == 0 && pr[..10].iter().all(|c| *c >= required) {
-                        pr[10] = 1;
-                        newly_valid += 1;
-                    }
-                    t_prog.insert(key, pr.as_slice())?;
+                    progress[i] = c;
                 }
-            }
+                if progress[..10].iter().all(|c| *c >= required) {
+                    progress[10] = 1;
+                    newly_valid += 1;
+                }
+                t_prog.insert((platform.as_str(), game_id), progress.as_slice())?;
 
-            if newly_valid > 0 {
-                let total = self
-                    .valid_samples
-                    .entry(platform.clone())
-                    .and_modify(|v| *v += newly_valid)
-                    .or_insert(newly_valid);
-                let mut t_meta = txn.open_table(T_META)?;
-                t_meta.insert(
-                    format!("valid_samples_{platform}").as_str(),
-                    total.to_le_bytes().as_slice(),
-                )?;
+                for (i, pid) in player_ids.iter().enumerate() {
+                    let val = postcard::to_allocvec(&(game_id, i as u8))?;
+                    t_tl.insert((*pid, ts_ms), val.as_slice())?;
+                }
+
+                // Retroactive: this match is now a stored predecessor for the
+                // player's later stored games. Counts are monotone in game time,
+                // so stop at the first later game already at the cap.
+                for pid in &player_ids {
+                    for kv in t_tl.range((*pid, ts_ms + 1)..=(*pid, u64::MAX))? {
+                        let (_, v) = kv?;
+                        let (gid2, pos2): (u64, u8) = postcard::from_bytes(v.value())?;
+                        let key = (platform.as_str(), gid2);
+                        let Some(mut pr) = t_prog.get(key)?.and_then(|g| {
+                            <[u8; 11]>::try_from(g.value()).ok()
+                        }) else {
+                            continue; // legacy/remake match without slot counts
+                        };
+                        let slot = pos2 as usize;
+                        if pr[slot] >= required {
+                            break;
+                        }
+                        pr[slot] += 1;
+                        if pr[10] == 0 && pr[..10].iter().all(|c| *c >= required) {
+                            pr[10] = 1;
+                            newly_valid += 1;
+                        }
+                        t_prog.insert(key, pr.as_slice())?;
+                    }
+                }
+
+                if newly_valid > 0 {
+                    let total = self
+                        .valid_samples
+                        .entry(platform.clone())
+                        .and_modify(|v| *v += newly_valid)
+                        .or_insert(newly_valid);
+                    let mut t_meta = txn.open_table(T_META)?;
+                    t_meta.insert(
+                        format!("valid_samples_{platform}").as_str(),
+                        total.to_le_bytes().as_slice(),
+                    )?;
+                }
             }
         }
         txn.commit()?;
 
+        // A date roll flushes the old day's buffer to disk; checkpoint first
+        // so those bytes never reference ids only fast-path txns know about.
+        if self.writers.get(&platform).is_some_and(|w| w.needs_roll()) {
+            self.durable_checkpoint()?;
+            self.writers.get_mut(&platform).unwrap().roll()?;
+        }
         let writer = match self.writers.entry(platform.clone()) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => e.insert(SegmentWriter::open(
@@ -613,7 +701,7 @@ impl Store {
         if new.is_empty() {
             return Ok(new);
         }
-        let txn = self.db.begin_write()?;
+        let txn = self.begin_fast()?;
         {
             let mut t_coh = txn.open_table(T_COHORT)?;
             let mut t_out = txn.open_table(T_OUTSIDER)?;
@@ -653,7 +741,7 @@ impl Store {
         player_id: u32,
         task: &FrontierTask,
     ) -> Result<()> {
-        let txn = self.db.begin_write()?;
+        let txn = self.begin_fast()?;
         {
             let mut t_idx = txn.open_table(T_FRONTIER_IDX)?;
             let mut t_f = txn.open_table(T_FRONTIER)?;
@@ -685,7 +773,7 @@ impl Store {
         platform: &str,
         now_ms: u64,
     ) -> Result<Option<(u8, u32, FrontierTask)>> {
-        let txn = self.db.begin_write()?;
+        let txn = self.begin_fast()?;
         let mut popped: Option<(u8, u32, FrontierTask)> = None;
         {
             let mut t_f = txn.open_table(T_FRONTIER)?;
@@ -727,7 +815,7 @@ impl Store {
         if items.is_empty() {
             return Ok(());
         }
-        let txn = self.db.begin_write()?;
+        let txn = self.begin_fast()?;
         {
             let mut t_idx = txn.open_table(T_FRONTIER_IDX)?;
             let mut t_f = txn.open_table(T_FRONTIER)?;
@@ -790,6 +878,119 @@ impl Store {
         Ok(best)
     }
 
+    /// Re-enqueues cohort members that have no frontier entry (e.g. an
+    /// adoption whose enqueue never landed, or a pop lost to a crash).
+    /// Platform is inferred by probing the progress table for the player's
+    /// most recent stored game; members with no stored games are left alone
+    /// (apex/ladder members re-enroll at the next seed anyway). Run once at
+    /// startup. Returns how many players were re-queued.
+    pub fn frontier_reconcile(&mut self, now_ms: u64) -> Result<usize> {
+        let stranded: Vec<u32> = {
+            let txn = self.db.begin_read()?;
+            let t_idx = txn.open_table(T_FRONTIER_IDX)?;
+            let t_coh = txn.open_table(T_COHORT)?;
+            let mut v = Vec::new();
+            for kv in t_coh.iter()? {
+                let pid = kv?.0.value();
+                if t_idx.get(pid)?.is_none() {
+                    v.push(pid);
+                }
+            }
+            v
+        };
+        if stranded.is_empty() {
+            return Ok(0);
+        }
+        let puuid_of: HashMap<u32, String> =
+            self.players.iter().map(|(p, id)| (*id, p.clone())).collect();
+        let platforms: Vec<&'static str> =
+            config::enabled_regions().iter().map(|r| r.platform).collect();
+
+        let mut items: HashMap<&'static str, Vec<(u32, FrontierTask)>> = HashMap::new();
+        {
+            let txn = self.db.begin_read()?;
+            let t_tl = txn.open_table(T_PLAYER_TL)?;
+            let t_prog = txn.open_table(T_PROGRESS)?;
+            for pid in stranded {
+                let Some(puuid) = puuid_of.get(&pid) else {
+                    tracing::warn!(pid, "cohort member without puuid mapping, skipped");
+                    continue;
+                };
+                let last_game =
+                    match t_tl.range((pid, 0u64)..=(pid, u64::MAX))?.next_back() {
+                        Some(kv) => {
+                            let (_, v) = kv?;
+                            let (gid, _): (u64, u8) = postcard::from_bytes(v.value())?;
+                            Some(gid)
+                        }
+                        None => None,
+                    };
+                let Some(gid) = last_game else {
+                    continue; // no stored games yet; seeding will re-enqueue
+                };
+                let Some(platform) =
+                    platforms.iter().find(|p| {
+                        t_prog.get((**p, gid)).is_ok_and(|v| v.is_some())
+                    })
+                else {
+                    tracing::warn!(pid, gid, "stranded cohort member on unknown platform, skipped");
+                    continue;
+                };
+                items.entry(platform).or_default().push((
+                    pid,
+                    FrontierTask { puuid: puuid.clone(), last_visit_ms: 0 },
+                ));
+            }
+        }
+        let mut queued = 0;
+        for (platform, batch) in items {
+            queued += batch.len();
+            tracing::info!(platform, n = batch.len(), "re-queued stranded cohort members");
+            self.frontier_push_batch(platform, BUCKET_PRIORITY, now_ms, &batch)?;
+        }
+        Ok(queued)
+    }
+
+    /// `backfill` startup mode: reschedules every queued cohort member to
+    /// *now* as a deep visit (full-history matchlist walk, no age cutoff).
+    /// Normal scheduling resumes per player as their deep visit completes.
+    /// Returns how many tasks were converted.
+    pub fn frontier_backfill_reset(&mut self, now_ms: u64) -> Result<u64> {
+        let entries: Vec<(String, u64, u32, FrontierTask)> = {
+            let txn = self.db.begin_read()?;
+            let t_f = txn.open_table(T_FRONTIER)?;
+            let mut v = Vec::new();
+            for kv in t_f.iter()? {
+                let (k, val) = kv?;
+                let (platform, bucket, due, pid) = k.value();
+                if bucket != BUCKET_PRIORITY || !self.cohort.contains(&pid) {
+                    continue;
+                }
+                v.push((platform.to_string(), due, pid, postcard::from_bytes(val.value())?));
+            }
+            v
+        };
+        let n = entries.len() as u64;
+        let txn = self.begin_fast()?;
+        {
+            let mut t_f = txn.open_table(T_FRONTIER)?;
+            let mut t_idx = txn.open_table(T_FRONTIER_IDX)?;
+            for (platform, due, pid, task) in entries {
+                t_f.remove((platform.as_str(), BUCKET_PRIORITY, due, pid))?;
+                let deep = FrontierTask { puuid: task.puuid, last_visit_ms: DEEP_VISIT_MS };
+                t_f.insert(
+                    (platform.as_str(), BUCKET_PRIORITY, now_ms, pid),
+                    postcard::to_allocvec(&deep)?.as_slice(),
+                )?;
+                let key =
+                    FrontierKey { platform, bucket: BUCKET_PRIORITY, due_ms: now_ms };
+                t_idx.insert(pid, postcard::to_allocvec(&key)?.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(n)
+    }
+
     // ---- meta (seed cursors etc.) ----
 
     pub fn meta_get_u32(&self, key: &str) -> Result<Option<u32>> {
@@ -800,7 +1001,7 @@ impl Store {
     }
 
     pub fn meta_set_u32(&self, key: &str, val: u32) -> Result<()> {
-        let txn = self.db.begin_write()?;
+        let txn = self.begin_fast()?;
         {
             let mut t = txn.open_table(T_META)?;
             t.insert(key, val.to_le_bytes().as_slice())?;
@@ -856,28 +1057,27 @@ impl Store {
 
     // ---- commit ----
 
-    /// Flushes segment blocks (fsync), then commits bitmaps + buffered rank
-    /// snapshots in one transaction.
+    /// Full durable commit, in the only safe order:
+    /// 1. durable redb checkpoint — persists every fast-path txn (player
+    ///    ids, progress, frontier, cohort) + buffered rank snapshots;
+    /// 2. segment blocks flush + fsync (their ids are now durable);
+    /// 3. seen-bitmaps commit last, so a bitmap can never claim a match
+    ///    whose segment bytes weren't flushed.
     pub fn commit(&mut self) -> Result<()> {
+        self.durable_checkpoint()?;
         for w in self.writers.values_mut() {
             w.flush()?;
         }
-        if !self.dirty_bitmaps && self.pending_ranks.is_empty() {
+        if !self.dirty_bitmaps {
             return Ok(());
         }
         let txn = self.db.begin_write()?;
         {
             let mut t_meta = txn.open_table(T_META)?;
-            if self.dirty_bitmaps {
-                for (platform, bm) in &self.seen {
-                    let mut buf = Vec::with_capacity(bm.serialized_size());
-                    bm.serialize_into(&mut buf)?;
-                    t_meta.insert(format!("bitmap_{platform}").as_str(), buf.as_slice())?;
-                }
-            }
-            let mut t_ranks = txn.open_table(T_RANKS)?;
-            for (pid, ts, val) in self.pending_ranks.drain(..) {
-                t_ranks.insert((pid, ts), val.as_slice())?;
+            for (platform, bm) in &self.seen {
+                let mut buf = Vec::with_capacity(bm.serialized_size());
+                bm.serialize_into(&mut buf)?;
+                t_meta.insert(format!("bitmap_{platform}").as_str(), buf.as_slice())?;
             }
         }
         txn.commit()?;
@@ -896,5 +1096,181 @@ impl Drop for Store {
         if let Err(e) = self.commit() {
             tracing::error!(error = %e, "final commit failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::Participant;
+
+    fn test_store(name: &str) -> (PathBuf, Store) {
+        let dir = std::env::temp_dir()
+            .join(format!("lolcrawler-test-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = Store::open(dir.to_str().unwrap()).unwrap();
+        (dir, store)
+    }
+
+    fn mk_match(platform: &str, game_id: u64, duration_s: u32) -> MatchRecord {
+        MatchRecord {
+            schema_version: 1,
+            game_id,
+            platform: platform.to_string(),
+            queue_id: 420,
+            game_start_ms: game_id as i64,
+            duration_s,
+            blue_won: true,
+            game_version: String::new(),
+            patch_major: 16,
+            patch_minor: 1,
+            participants: (0..10)
+                .map(|i| Participant {
+                    player_id: 0,
+                    champion_id: 1,
+                    position: (i % 5) as u32,
+                    spell1: 0,
+                    spell2: 0,
+                    runes: vec![],
+                    stats: vec![],
+                })
+                .collect(),
+            timeline: None,
+            bans: vec![],
+        }
+    }
+
+    fn progress_of(store: &Store, platform: &str, game_id: u64) -> Vec<u8> {
+        let txn = store.db.begin_read().unwrap();
+        let t = txn.open_table(T_PROGRESS).unwrap();
+        t.get((platform, game_id)).unwrap().unwrap().value().to_vec()
+    }
+
+    #[test]
+    fn restore_is_idempotent_and_remakes_earn_nothing() {
+        let platform = config::enabled_regions()[0].platform;
+        let (dir, mut store) = test_store("idem");
+        let puuids: Vec<String> = (0..10).map(|i| format!("p{i:02}")).collect();
+
+        let mut rec = mk_match(platform, 100, 1800);
+        store.store_match(&mut rec, &puuids, 100, false).unwrap();
+        assert_eq!(store.outsider_seen.values().sum::<u32>(), 10);
+        assert_eq!(progress_of(&store, platform, 100), vec![0u8; 11]);
+
+        // Re-store (crash re-fetch): no double adoption or history credit.
+        let mut again = mk_match(platform, 100, 1800);
+        store.store_match(&mut again, &puuids, 100, false).unwrap();
+        assert_eq!(store.outsider_seen.values().sum::<u32>(), 10);
+
+        // Remake: archived with an empty progress marker, credits nothing.
+        let mut remake = mk_match(platform, 200, 120);
+        store.store_match(&mut remake, &puuids, 200, false).unwrap();
+        assert_eq!(store.outsider_seen.values().sum::<u32>(), 10);
+        assert!(progress_of(&store, platform, 200).is_empty());
+
+        // Game 300 sees exactly 1 stored predecessor per player (game 100;
+        // the remake earns no history credit, the re-store didn't double).
+        let mut later = mk_match(platform, 300, 1800);
+        store.store_match(&mut later, &puuids, 300, false).unwrap();
+        let mut want = vec![1u8; 10];
+        want.push(0);
+        assert_eq!(progress_of(&store, platform, 300), want);
+
+        // Backfill (game 50) retro-bumps both later games exactly once.
+        let mut backfill = mk_match(platform, 50, 1800);
+        store.store_match(&mut backfill, &puuids, 50, false).unwrap();
+        let mut want100 = vec![1u8; 10];
+        want100.push(0);
+        let mut want300 = vec![2u8; 10];
+        want300.push(0);
+        assert_eq!(progress_of(&store, platform, 100), want100);
+        assert_eq!(progress_of(&store, platform, 300), want300);
+
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn brake_defers_adoption_until_lifted() {
+        let platform = config::enabled_regions()[0].platform;
+        let (dir, mut store) = test_store("brake");
+        let puuids: Vec<String> = (0..10).map(|i| format!("b{i:02}")).collect();
+
+        // Two sightings while braked: counts accrue past the threshold (2)
+        // but nobody joins the cohort.
+        let mut a = mk_match(platform, 100, 1800);
+        store.store_match(&mut a, &puuids, 100, true).unwrap();
+        let mut b = mk_match(platform, 200, 1800);
+        store.store_match(&mut b, &puuids, 200, true).unwrap();
+        assert_eq!(store.cohort.len(), 0);
+        assert!(store.outsider_seen.values().all(|c| *c == 2));
+
+        // First sighting after the brake lifts converts everyone.
+        let mut c = mk_match(platform, 300, 1800);
+        let outcome = store.store_match(&mut c, &puuids, 300, false).unwrap();
+        assert_eq!(outcome.adopted.len(), 10);
+        assert_eq!(store.cohort.len(), 10);
+        assert!(store.outsider_seen.is_empty());
+
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backfill_reset_converts_queued_cohort_to_deep_visits() {
+        let platform = config::enabled_regions()[0].platform;
+        let (dir, mut store) = test_store("backfill");
+        let puuids: Vec<String> = (0..3).map(|i| format!("d{i:02}")).collect();
+        let pids = store.assign_player_ids(&puuids).unwrap();
+        store.cohort_add_batch(&pids, COHORT_SRC_APEX, 1).unwrap();
+        // Queued far in the future, as after a normal visit.
+        let far = 9_000_000_000_000u64;
+        for (pid, puuid) in pids.iter().zip(&puuids) {
+            let task = FrontierTask { puuid: puuid.clone(), last_visit_ms: 500 };
+            store.frontier_push(platform, BUCKET_PRIORITY, far, *pid, &task).unwrap();
+        }
+        // A non-cohort legacy entry must be left alone.
+        let outsider = store.assign_player_ids(&["legacy".to_string()]).unwrap()[0];
+        let legacy = FrontierTask { puuid: "legacy".into(), last_visit_ms: 500 };
+        store.frontier_push(platform, BUCKET_PRIORITY, far, outsider, &legacy).unwrap();
+
+        assert_eq!(store.frontier_backfill_reset(1_000).unwrap(), 3);
+        // All cohort members are now due immediately, flagged deep.
+        for _ in 0..3 {
+            let (_, pid, task) = store.frontier_pop_due(platform, 2_000).unwrap().unwrap();
+            assert!(pids.contains(&pid));
+            assert_eq!(task.last_visit_ms, DEEP_VISIT_MS);
+        }
+        // The legacy entry is untouched at its original due time.
+        assert!(store.frontier_pop_due(platform, 2_000).unwrap().is_none());
+        let (_, pid, task) = store.frontier_pop_due(platform, u64::MAX).unwrap().unwrap();
+        assert_eq!(pid, outsider);
+        assert_eq!(task.last_visit_ms, 500);
+
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconcile_requeues_stranded_cohort_members() {
+        let platform = config::enabled_regions()[0].platform;
+        let (dir, mut store) = test_store("reconcile");
+        let puuids: Vec<String> = (0..10).map(|i| format!("q{i:02}")).collect();
+        let pids = store.assign_player_ids(&puuids).unwrap();
+        store.cohort_add_batch(&pids, COHORT_SRC_ADOPTED, 1).unwrap();
+        let mut rec = mk_match(platform, 100, 1800);
+        store.store_match(&mut rec, &puuids, 100, false).unwrap();
+
+        // The frontier enqueue "never landed" — all 10 are stranded.
+        assert!(store.frontier_pop_due(platform, u64::MAX).unwrap().is_none());
+        assert_eq!(store.frontier_reconcile(5_000).unwrap(), 10);
+        // Idempotent: nothing left to reconcile once everyone is queued.
+        assert_eq!(store.frontier_reconcile(5_000).unwrap(), 0);
+        let (_, pid, task) = store.frontier_pop_due(platform, u64::MAX).unwrap().unwrap();
+        assert!(pids.contains(&pid));
+        assert!(task.puuid.starts_with('q'));
+
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
