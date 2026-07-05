@@ -15,13 +15,16 @@ The crawler is split into two programs (workspace crates):
 - **`crawler-server`** (`crates/server`) — runs on one host, owns *all*
   crawl logic and *all* data, and makes **zero** Riot API requests. Every
   Riot fetch becomes an opaque job `{host, method, path}` handed to a node.
-- **`crawler-node`** (`crates/node`) — a small CLI you give to friends.
-  Each node enrolls once with an invite code, then pulls jobs, executes
-  them with *its operator's own Riot API key* at full rate-limit speed
-  (the same two-layer sliding-window limiters + header adoption the
-  original crawler used), and uploads the raw bodies. Nodes know nothing
-  about the crawl strategy, so the server can evolve freely without
-  breaking deployed nodes.
+- **`crawler-node`** (`crates/node`) — the node core **library** plus a
+  small CLI for power users. Each node enrolls once with an invite code,
+  then pulls jobs, executes them with *its operator's own Riot API key* at
+  full rate-limit speed (the same two-layer sliding-window limiters +
+  header adoption the original crawler used), and uploads the raw bodies.
+  Nodes know nothing about the crawl strategy, so the server can evolve
+  freely without breaking deployed nodes.
+- **`crawler-desktop`** (`crates/desktop`) — **Crawl Crew**, the friendly
+  Tauri GUI over the same node library (identical crawl loop). This is
+  what you actually send to friends; see below.
 - **`crawler-proto`** (`crates/proto`) — the tiny JSON wire protocol
   (additive-changes-only; version header, 426 on real breaks).
 
@@ -76,6 +79,42 @@ plain `crawler-node` resumes. Dev keys expire daily: on a 401/403 the node
 pauses and `crawler-node set-key` (or editing the config) resumes it
 within ~15 s. The key never leaves their machine — the server only ever
 sees fetched bodies.
+
+### Crawl Crew — the desktop node
+
+```sh
+cargo build --release -p crawler-desktop   # needs webkit2gtk-4.1/gtk3 dev libs on Linux
+```
+
+Same node core as the CLI, wrapped in a warm little app your friends will
+actually enjoy leaving open:
+
+- **Left panel** — live visualization of jobs flowing: orbs drop in as the
+  server hands out work (colored per routing host), bob while the Riot
+  request runs, then swoosh into the "delivered" vault; rotating thank-you
+  messages, lifetime counters, and milestone confetti (100 / 1k / 10k /
+  ... matches).
+- **Right panel** — the crew leaderboard with **60 min / 24 h / 7 d /
+  all-time** tabs, powered by the server's `/v1/stats` endpoint (per-node
+  minute ring + hourly buckets persisted in redb, so nobody's all-time
+  glory is lost to a restart).
+- **Key expiry QoL** — when Riot rejects the key, a native notification
+  fires and an in-app banner takes the new key; crawling resumes in
+  seconds. First run shows an enrollment form (server, name, invite code,
+  key) instead of CLI prompts.
+- **Resource discipline** — closing the window *destroys* the webview
+  (frees its RAM; ~15 MB Rust core keeps crawling) and the tray icon
+  brings it back. The canvas only animates while visible, the leaderboard
+  polls every 45 s, and quitting from the tray drains result uploads.
+
+The stats flow adds two things server-side: completions are bucketed per
+node (`stats.rs`, flushed to the `node_stats` redb table ~1/min) and
+`POST /v1/stats` returns the windowed leaderboard. Both are additive —
+protocol still v1, old CLI nodes unaffected.
+
+Windows/macOS builds must currently be produced on that OS (or CI):
+`cargo tauri build` there yields a signed-nothing, single-file installer;
+WebView2 is preinstalled on Windows 10/11.
 
 ### Backfill
 
@@ -216,7 +255,12 @@ enforcement: an *app* limiter per routing host and a *method* limiter per
 100 req/2 min) and adopt the live windows from `X-App-Rate-Limit` /
 `X-Method-Rate-Limit` response headers, so a production key applies with
 no config change. 429 cooldowns honor `Retry-After` and are scoped by
-`X-Rate-Limit-Type` to the offending layer. Dev-key sustained ceiling is
+`X-Rate-Limit-Type` to the offending layer. App limiters additionally
+*pace*: sends are spread at the sustained rate with randomized gaps
+(mean gap = tightest `window / limit`, so utilization stays ~100% of
+budget) instead of bursting a whole window and starving — the stream is
+continuous, restarts no longer trigger a 429 storm, and the Crawl Crew
+visualization flows instead of pulsing. Dev-key sustained ceiling is
 ~0.83 req/s per host *per node*: expect **~40–50 matches/hr stored per
 node** without timelines (half that with `FETCH_TIMELINES` on).
 

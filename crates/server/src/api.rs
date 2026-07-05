@@ -27,6 +27,7 @@ const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub struct AppState {
     pub broker: Arc<Broker>,
     pub registry: Arc<Registry>,
+    pub stats: Arc<crate::stats::Stats>,
     pub store: Arc<Mutex<Store>>,
     pub data_dir: String,
 }
@@ -36,6 +37,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/v1/enroll", post(enroll))
         .route("/v1/work", post(work))
         .route("/v1/result", post(result))
+        .route("/v1/stats", post(stats))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
@@ -173,4 +175,69 @@ async fn result(
     st.broker.complete(node_id, res);
     // A JSON body, not a bare 200: the node parses the response.
     Json(serde_json::json!({"ok": true})).into_response()
+}
+
+/// Leaderboard for GUI nodes. A node polling counts as "online" if it hit
+/// any endpoint within two long-poll cycles.
+async fn stats(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = check_proto(&headers) {
+        return r;
+    }
+    let node_id = match auth(&headers, &st.registry) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let windows: HashMap<u32, crate::stats::NodeWindows> = st
+        .stats
+        .snapshot(now_ms)
+        .into_iter()
+        .map(|w| (w.node_id, w))
+        .collect();
+
+    let counts = |b: &crate::stats::NodeWindows| {
+        let req = proto::WindowCounts {
+            m60: b.m60.requests,
+            h24: b.h24.requests,
+            d7: b.d7.requests,
+            all: b.all.requests,
+        };
+        let mat = proto::WindowCounts {
+            m60: b.m60.matches,
+            h24: b.h24.matches,
+            d7: b.d7.matches,
+            all: b.all.matches,
+        };
+        (req, mat)
+    };
+
+    let mut nodes: Vec<proto::NodeStatsEntry> = st
+        .registry
+        .report()
+        .into_iter()
+        .map(|r| {
+            let (requests, matches) = windows
+                .get(&r.id)
+                .map(counts)
+                .unwrap_or_default();
+            proto::NodeStatsEntry {
+                name: r.name,
+                online: r.idle_secs.is_some_and(|s| s < 120),
+                requests,
+                matches,
+            }
+        })
+        .collect();
+    nodes.sort_by(|a, b| b.requests.all.cmp(&a.requests.all).then(a.name.cmp(&b.name)));
+
+    Json(proto::StatsResponse {
+        you: st.registry.name_of(node_id),
+        nodes,
+        generated_ms: now_ms,
+    })
+    .into_response()
 }

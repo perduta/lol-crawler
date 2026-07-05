@@ -1,26 +1,16 @@
-//! crawler-node: a dumb, rate-limit-maximizing Riot API fetcher.
-//!
-//! Connects to a crawler-server, enrolls once with an invite code (the
-//! server issues a token saved locally), then pulls opaque GET jobs,
-//! executes them with the operator's own Riot API key at full budget, and
-//! uploads the bodies. It knows nothing about the crawl strategy, so
-//! server-side changes never require a node update.
+//! crawler-node CLI: the power-user frontend over the node core library.
+//! (The desktop app is the friendly one; both run the identical loop.)
 //!
 //! Usage:
 //!   crawler-node --server http://host:8420    first run (enrollment)
 //!   crawler-node                              subsequent runs
 //!   crawler-node set-key                      update the Riot API key
 
-mod config;
-mod executor;
-mod ratelimit;
-mod worker;
-
 use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use crawler_proto as proto;
+use crawler_node::{config, events, worker};
 
 fn prompt(question: &str) -> Result<String> {
     print!("{question}: ");
@@ -73,29 +63,7 @@ async fn enroll(server: &str, config_path: &PathBuf) -> Result<config::NodeConfi
     let invite_code = prompt("invite code (ask the server operator)")?;
     let riot_api_key = prompt("your Riot API key (RGAPI-..., from developer.riotgames.com)")?;
 
-    let http = reqwest::Client::new();
-    let resp = http
-        .post(format!("{}/v1/enroll", server.trim_end_matches('/')))
-        .header(proto::PROTO_HEADER, proto::PROTOCOL_VERSION.to_string())
-        .json(&proto::EnrollRequest {
-            invite_code,
-            name: name.clone(),
-            client_version: env!("CARGO_PKG_VERSION").to_string(),
-        })
-        .send()
-        .await
-        .context("connecting to server")?;
-    let status = resp.status();
-    if !status.is_success() {
-        let msg = resp
-            .json::<proto::ErrorResponse>()
-            .await
-            .map(|e| e.message)
-            .unwrap_or_else(|_| status.to_string());
-        bail!("enrollment failed: {msg}");
-    }
-    let er: proto::EnrollResponse = resp.json().await?;
-
+    let er = crawler_node::enroll_request(server, &name, &invite_code).await?;
     let cfg = config::NodeConfig {
         server: server.trim_end_matches('/').to_string(),
         name: er.name,
@@ -145,5 +113,19 @@ async fn main() -> Result<()> {
         }
     };
 
-    worker::run(cfg, args.config_path).await
+    let handle = events::NodeHandle::new();
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        let _ = stop_tx.send(true);
+    });
+
+    match worker::run(cfg, args.config_path, handle, stop_rx).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.downcast_ref::<worker::ProtocolMismatch>().is_some() => {
+            eprintln!("\nserver says: {e}\n");
+            std::process::exit(2);
+        }
+        Err(e) => Err(e),
+    }
 }

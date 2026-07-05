@@ -19,6 +19,7 @@ mod metrics;
 mod record;
 mod registry;
 mod riot;
+mod stats;
 mod storage;
 
 use std::sync::Arc;
@@ -86,10 +87,13 @@ async fn main() -> Result<()> {
     for (id, rec) in store.nodes_all()? {
         registry.enroll_runtime(id, rec.name, rec.token_sha256_hex);
     }
+    // Leaderboard stats: hour buckets reload from redb, minute detail is
+    // fresh each run.
+    let stats = Arc::new(stats::Stats::load(store.node_stats_all()?, now_ms));
     let store = Arc::new(Mutex::new(store));
 
     let audit_percent = config::audit_dup_percent();
-    let broker = Arc::new(broker::Broker::new(registry.clone(), audit_percent));
+    let broker = Arc::new(broker::Broker::new(registry.clone(), stats.clone(), audit_percent));
     let client = Arc::new(RiotClient::new(broker.clone()));
     let (stop_tx, stop_rx) = watch::channel(false);
 
@@ -108,6 +112,7 @@ async fn main() -> Result<()> {
     let app = api::router(api::AppState {
         broker: broker.clone(),
         registry: registry.clone(),
+        stats: stats.clone(),
         store: store.clone(),
         data_dir: data_dir.clone(),
     });
@@ -136,6 +141,28 @@ async fn main() -> Result<()> {
         ));
     }
     handles.push(broker::spawn_sweeper(broker.clone(), stop_rx.clone()));
+    // Stats flusher: dirty leaderboard hour buckets -> redb, ~1/min.
+    {
+        let stats = stats.clone();
+        let store = store.clone();
+        let mut stop = stop_rx.clone();
+        handles.push(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                    _ = stop.changed() => break,
+                }
+                let dirty = stats.take_dirty();
+                if let Err(e) = store.lock().await.node_stats_upsert(&dirty) {
+                    tracing::warn!(error = %e, "stats flush failed");
+                }
+            }
+            let dirty = stats.take_dirty();
+            if let Err(e) = store.lock().await.node_stats_upsert(&dirty) {
+                tracing::warn!(error = %e, "final stats flush failed");
+            }
+        }));
+    }
     handles.push(tokio::spawn(metrics::reporter(
         metrics.clone(),
         registry.clone(),

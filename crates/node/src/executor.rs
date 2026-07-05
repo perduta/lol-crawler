@@ -43,13 +43,18 @@ impl Executor {
         self.key_bad.store(false, Ordering::Relaxed);
     }
 
-    pub async fn execute(&self, job: &Job) -> JobResult {
+    /// Runs one job. `on_send` fires once, right before the first wire
+    /// attempt — i.e. the moment the job stops queueing on local limiters
+    /// and becomes network activity (frontends flip the visualization from
+    /// "waiting" to "working" on it).
+    pub async fn execute(&self, job: &Job, on_send: impl Fn() + Send) -> JobResult {
         let url = format!("https://{}.api.riotgames.com{}", job.host, job.path);
         // Method limiter first: waiting on a tight method budget must not
         // consume app-budget slots that other endpoints could use.
         let method_limiter = self.limiters.method(&job.host, &job.method);
         let app_limiter = self.limiters.app(&job.host);
         let mut attempts = 0u32;
+        let mut announced = false;
         let fail = |e: String| JobResult {
             id: job.id,
             outcome: JobOutcome::Failed,
@@ -60,6 +65,10 @@ impl Executor {
             attempts += 1;
             method_limiter.acquire().await;
             app_limiter.acquire().await;
+            if !announced {
+                announced = true;
+                on_send();
+            }
             let api_key = self.api_key.read().unwrap().clone();
             let resp = self.http.get(&url).header("X-Riot-Token", api_key).send().await;
             match resp {

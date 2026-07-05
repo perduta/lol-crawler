@@ -109,3 +109,47 @@ pub struct JobResult {
 pub struct ErrorResponse {
     pub message: String,
 }
+
+// ---- stats / leaderboard (additive; only GUI nodes call this) ----
+
+/// One counter over the four leaderboard windows.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+pub struct WindowCounts {
+    /// Last 60 minutes (minute resolution).
+    #[serde(default)]
+    pub m60: u64,
+    /// Last 24 hours (hour resolution).
+    #[serde(default)]
+    pub h24: u64,
+    /// Last 7 days (hour resolution).
+    #[serde(default)]
+    pub d7: u64,
+    /// All time.
+    #[serde(default)]
+    pub all: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeStatsEntry {
+    pub name: String,
+    /// Polled the server recently.
+    #[serde(default)]
+    pub online: bool,
+    /// Riot API requests served (the leaderboard metric).
+    #[serde(default)]
+    pub requests: WindowCounts,
+    /// Full match bodies delivered (the feel-good metric).
+    #[serde(default)]
+    pub matches: WindowCounts,
+}
+
+/// `POST /v1/stats` (empty body) — the whole fleet's contribution board.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatsResponse {
+    /// The calling node's name, so the UI can highlight "you".
+    pub you: String,
+    #[serde(default)]
+    pub nodes: Vec<NodeStatsEntry>,
+    #[serde(default)]
+    pub generated_ms: u64,
+}

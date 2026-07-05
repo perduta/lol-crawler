@@ -8,6 +8,18 @@
 //! `X-Method-Rate-Limit` response headers as soon as one is seen, so a
 //! production key needs no config change. 429 cooldowns are scoped by
 //! `X-Rate-Limit-Type` to the offending layer.
+//!
+//! App limiters additionally *pace*: instead of bursting a whole window's
+//! budget at once and then starving (100 sends in ~5 s, then ~115 s of
+//! silence on a dev key), sends are spread at the sustained rate with
+//! randomized gaps. The average gap equals `window / limit` for the
+//! tightest window, so utilization is still ~100% of budget — the stream
+//! is just continuous (and the desktop visualization flows instead of
+//! pulsing). A side bonus: no 100-request burst right after a restart, so
+//! the leftover spend in Riot's server-side window no longer triggers a
+//! 429 storm. The sliding windows stay on as the hard cap beneath the
+//! pacer; method limiters are left bursty on purpose (their budgets are
+//! rarely binding and pacing them would only delay league seeds).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -53,19 +65,30 @@ struct Windows {
     sent: VecDeque<Instant>,
     /// Do not send anything before this time (set on 429).
     cooldown_until: Option<Instant>,
+    /// Pacing: earliest time the next send may go out (paced limiters).
+    next_slot: Option<Instant>,
 }
 
 pub struct RateLimiter {
     inner: Mutex<Windows>,
     key: String,
+    /// Spread sends at the sustained rate with random gaps instead of
+    /// bursting the window budget (used for app limiters).
+    pace: bool,
     sent_total: std::sync::atomic::AtomicU64,
 }
 
 impl RateLimiter {
-    pub fn new(key: &str, specs: Vec<WindowSpec>) -> Self {
+    pub fn new(key: &str, specs: Vec<WindowSpec>, pace: bool) -> Self {
         Self {
-            inner: Mutex::new(Windows { specs, sent: VecDeque::new(), cooldown_until: None }),
+            inner: Mutex::new(Windows {
+                specs,
+                sent: VecDeque::new(),
+                cooldown_until: None,
+                next_slot: None,
+            }),
             key: key.to_string(),
+            pace,
             sent_total: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -93,18 +116,27 @@ impl RateLimiter {
             let wait = {
                 let mut w = self.inner.lock().await;
                 let now = Instant::now();
+                let mut wait: Option<Duration> = None;
 
                 if let Some(until) = w.cooldown_until {
                     if until > now {
-                        Some(until - now)
+                        wait = Some(until - now);
                     } else {
                         w.cooldown_until = None;
-                        None
                     }
-                } else {
-                    None
                 }
-                .or_else(|| {
+
+                // Pacing gate: contenders woken together re-race; the winner
+                // advances `next_slot`, the rest sleep again.
+                if wait.is_none() && self.pace {
+                    if let Some(ns) = w.next_slot {
+                        if ns > now {
+                            wait = Some(ns - now);
+                        }
+                    }
+                }
+
+                if wait.is_none() {
                     let max_window = Duration::from_millis(
                         w.specs.iter().map(|s| s.window_ms).max().unwrap_or(0),
                     );
@@ -115,7 +147,6 @@ impl RateLimiter {
                             break;
                         }
                     }
-                    let mut wait: Option<Duration> = None;
                     for spec in &w.specs {
                         let win = Duration::from_millis(spec.window_ms);
                         let in_window = w
@@ -133,9 +164,24 @@ impl RateLimiter {
                     }
                     if wait.is_none() {
                         w.sent.push_back(now);
+                        if self.pace {
+                            // Mean gap = window/limit of the tightest window
+                            // (jitter is uniform on 0.35..1.65, mean 1.0), so
+                            // the long-run rate is exactly the budget — an
+                            // idle spell just resolves to "send immediately",
+                            // it never accumulates a burst allowance.
+                            let base_ms = w
+                                .specs
+                                .iter()
+                                .map(|s| s.window_ms as f64 / s.limit.max(1) as f64)
+                                .fold(0.0, f64::max);
+                            let jitter = 0.35 + rand::random::<f64>() * 1.3;
+                            w.next_slot =
+                                Some(now + Duration::from_millis((base_ms * jitter) as u64));
+                        }
                     }
-                    wait
-                })
+                }
+                wait
             };
             match wait {
                 None => {
@@ -174,7 +220,7 @@ impl LimiterRegistry {
     pub fn app(&self, host: &str) -> Arc<RateLimiter> {
         let mut map = self.app.lock().unwrap();
         map.entry(host.to_string())
-            .or_insert_with(|| Arc::new(RateLimiter::new(host, default_specs())))
+            .or_insert_with(|| Arc::new(RateLimiter::new(host, default_specs(), true)))
             .clone()
     }
 
@@ -182,7 +228,7 @@ impl LimiterRegistry {
         let mut map = self.method.lock().unwrap();
         map.entry((host.to_string(), method.to_string()))
             .or_insert_with(|| {
-                Arc::new(RateLimiter::new(&format!("{host}/{method}"), default_specs()))
+                Arc::new(RateLimiter::new(&format!("{host}/{method}"), default_specs(), false))
             })
             .clone()
     }

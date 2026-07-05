@@ -50,6 +50,10 @@ const T_OUTSIDER: TableDefinition<u32, u32> = TableDefinition::new("outsider_see
 const T_PROGRESS: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("sample_progress");
 /// node_id -> postcard NodeRec (enrolled crawler nodes; tokens stored hashed)
 const T_NODES: TableDefinition<u32, &[u8]> = TableDefinition::new("nodes");
+/// Per-node hourly contribution buckets `(node_id, hour_start_ms)`,
+/// upserted by the stats flusher; never pruned (all-time totals are the
+/// sum of all rows).
+const T_NODE_STATS: TableDefinition<(u32, u64), &[u8]> = TableDefinition::new("node_stats");
 
 pub const BUCKET_PRIORITY: u8 = 0; // cohort members
 pub const BUCKET_OTHER: u8 = 1; // legacy; drained and dropped
@@ -328,6 +332,7 @@ impl Store {
             txn.open_table(T_OUTSIDER)?;
             txn.open_table(T_PROGRESS)?;
             txn.open_table(T_NODES)?;
+            txn.open_table(T_NODE_STATS)?;
         }
         txn.commit()?;
 
@@ -773,6 +778,36 @@ impl Store {
         }
         txn.commit()?;
         Ok(id)
+    }
+
+    /// All persisted stats buckets, for [`crate::stats::Stats::load`].
+    pub fn node_stats_all(&self) -> Result<Vec<(u32, u64, crate::stats::Bucket)>> {
+        let txn = self.db.begin_read()?;
+        let t = txn.open_table(T_NODE_STATS)?;
+        let mut out = Vec::new();
+        for kv in t.iter()? {
+            let (k, v) = kv?;
+            let (node, hour) = k.value();
+            out.push((node, hour, postcard::from_bytes(v.value())?));
+        }
+        Ok(out)
+    }
+
+    /// Upserts dirty hour buckets (fast-path: durable at next checkpoint —
+    /// a crash costs at most a minute of leaderboard credit).
+    pub fn node_stats_upsert(&mut self, rows: &[(u32, u64, crate::stats::Bucket)]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let txn = self.begin_fast()?;
+        {
+            let mut t = txn.open_table(T_NODE_STATS)?;
+            for (node, hour, bucket) in rows {
+                t.insert((*node, *hour), postcard::to_allocvec(bucket)?.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     // ---- frontier ----

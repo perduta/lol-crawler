@@ -91,16 +91,22 @@ pub struct Broker {
     /// Woken whenever new work lands or shutdown starts (long-poll wakeup).
     pub notify: Notify,
     registry: std::sync::Arc<Registry>,
+    stats: std::sync::Arc<crate::stats::Stats>,
     audit_percent: f64,
     shutdown: AtomicBool,
 }
 
 impl Broker {
-    pub fn new(registry: std::sync::Arc<Registry>, audit_percent: f64) -> Self {
+    pub fn new(
+        registry: std::sync::Arc<Registry>,
+        stats: std::sync::Arc<crate::stats::Stats>,
+        audit_percent: f64,
+    ) -> Self {
         Self {
             inner: Mutex::new(Inner { next_id: 1, ..Default::default() }),
             notify: Notify::new(),
             registry,
+            stats,
             audit_percent,
             shutdown: AtomicBool::new(false),
         }
@@ -253,6 +259,9 @@ impl Broker {
                         let _ = tx.send(out);
                     }
                     self.registry.job_completed(node_id);
+                    let is_match = job.method == "match-v5.match"
+                        && res.outcome == crawler_proto::JobOutcome::Ok;
+                    self.stats.record(node_id, is_match, now_unix_ms());
                     if job.is_twin {
                         if let Some(pair) = inner.audits.get_mut(&res.id) {
                             pair.twin_node = Some(node_id);
@@ -423,6 +432,13 @@ impl Broker {
     }
 }
 
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Structural JSON comparison so formatting differences can't false-alarm;
 /// falls back to byte equality for non-JSON bodies.
 fn json_equal(a: &str, b: &str) -> bool {
@@ -463,7 +479,8 @@ mod tests {
         registry.enroll_runtime(2, "bob".into(), "h2".into());
         registry.touch(1);
         registry.touch(2);
-        (registry.clone(), Arc::new(Broker::new(registry, audit_percent)))
+        let stats = Arc::new(crate::stats::Stats::default());
+        (registry.clone(), Arc::new(Broker::new(registry, stats, audit_percent)))
     }
 
     fn ok_result(id: u64, body: &str) -> crawler_proto::JobResult {

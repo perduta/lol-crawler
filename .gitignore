@@ -3,3 +3,4 @@
 /data_*
 api_key.env
 *.env
+/crates/desktop/gen/

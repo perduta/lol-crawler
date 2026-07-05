@@ -32,6 +32,7 @@ struct NodeRt {
 
 #[derive(Clone, Debug)]
 pub struct NodeReport {
+    pub id: u32,
     pub name: String,
     pub completed: u64,
     pub audits_pass: u64,
@@ -138,8 +139,9 @@ impl Registry {
         let now = Instant::now();
         let mut v: Vec<NodeReport> = inner
             .nodes
-            .values()
-            .map(|n| NodeReport {
+            .iter()
+            .map(|(id, n)| NodeReport {
+                id: *id,
                 name: n.name.clone(),
                 completed: n.completed,
                 audits_pass: n.audits_pass,

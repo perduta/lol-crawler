@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Crawl Crew</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- expired-key banner -->
+    <div id="keybar">
+      <span class="msg" id="keybar-msg">💔 Riot expired your API key (dev keys last 24&nbsp;h). Paste a fresh one and we're back in business:</span>
+      <input id="keybar-input" placeholder="RGAPI-..." spellcheck="false" />
+      <button class="btn small" id="keybar-save">Save key</button>
+    </div>
+
+    <div id="main">
+      <!-- left: pride panel -->
+      <section class="card" id="left">
+        <div id="brand">
+          <div class="logo">💜</div>
+          <div class="title">Crawl Crew</div>
+          <div class="spacer"></div>
+          <span class="pill" id="status"><span class="dot"></span><span id="status-text">starting…</span></span>
+        </div>
+
+        <div id="greet">Hey <span class="name" id="who">friend</span>! 👋</div>
+        <div id="rotator">warming up the crawlers…</div>
+
+        <div id="counters">
+          <div class="counter matches"><div class="num" id="c-matches">0</div><div class="lbl">matches delivered · all time</div></div>
+          <div class="counter requests"><div class="num" id="c-requests">0</div><div class="lbl">requests served · all time</div></div>
+          <div class="counter session"><div class="num" id="c-session">0</div><div class="lbl">jobs · this session</div></div>
+        </div>
+
+        <div id="vizwrap">
+          <canvas id="viz"></canvas>
+          <div id="legend"></div>
+          <div id="vault">📦 <span id="vault-n">0</span> delivered</div>
+        </div>
+      </section>
+
+      <!-- right: leaderboard -->
+      <section class="card" id="right">
+        <h2>🏆 Crew leaderboard <span class="sub" id="board-when"></span></h2>
+        <div id="tabs">
+          <button data-w="m60" class="on">60 min</button>
+          <button data-w="h24">24 h</button>
+          <button data-w="d7">7 days</button>
+          <button data-w="all">all time</button>
+        </div>
+        <div id="board"><div class="empty">waiting for the first numbers…</div></div>
+        <div id="crewline"></div>
+      </section>
+    </div>
+  </div>
+
+  <!-- first-run enrollment -->
+  <div id="enroll">
+    <div class="box">
+      <h1>Join the crew 💜</h1>
+      <p class="tag">You're about to donate your Riot API budget to a friend's
+        research project. Your key never leaves this computer — the node only
+        uploads match data.</p>
+      <label>server address</label>
+      <input id="e-server" placeholder="http://server-host:8420" spellcheck="false" />
+      <label>your crew name</label>
+      <input id="e-name" placeholder="lowercase, e.g. anna" spellcheck="false" maxlength="32" />
+      <div class="hint">letters, digits, - and _ only</div>
+      <label>invite code</label>
+      <input id="e-invite" placeholder="ask the operator" spellcheck="false" />
+      <label>riot api key</label>
+      <input id="e-key" placeholder="RGAPI-…  (developer.riotgames.com)" spellcheck="false" />
+      <div class="err" id="e-err"></div>
+      <button class="btn" id="e-go">Start helping 🚀</button>
+    </div>
+  </div>
+
+  <!-- protocol mismatch -->
+  <div id="overlay">
+    <div class="box card">
+      <h1>⏫ Update needed</h1>
+      <p id="overlay-msg"></p>
+      <p>Ask the operator for the newest Crawl Crew build — your data is safe
+        and nothing else is needed on your side.</p>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
