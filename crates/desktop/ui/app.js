@@ -634,6 +634,19 @@ function startMain() {
   document.addEventListener("visibilitychange", () => { if (!document.hidden) pollStats(); });
 }
 
+// The window is created hidden (tauri.conf.json) so the user never sees
+// the webview's white pre-paint frame; we show it once real content has
+// painted. The timeout is a hard floor: whatever goes wrong above, the
+// window must never stay invisible.
+let revealed = false;
+function reveal() {
+  if (revealed) return;
+  revealed = true;
+  const w = window.__TAURI__.window.getCurrentWindow();
+  w.show().then(() => w.setFocus()).catch(() => {});
+}
+setTimeout(reveal, 2000);
+
 (async function init() {
   await listen("node", (e) => onNodeEvent(e.payload));
   ui = await invoke("get_state");
@@ -642,4 +655,6 @@ function startMain() {
   } else {
     startMain();
   }
+  // Two rAFs: the first fires before this frame paints, the second after.
+  requestAnimationFrame(() => requestAnimationFrame(reveal));
 })();
