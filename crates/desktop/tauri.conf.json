@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Crawl Crew",
-  "version": "0.1.0",
   "identifier": "me.pperduta.crawlcrew",
   "build": {
     "frontendDist": "ui"
@@ -27,11 +26,23 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/icon.png",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQ4MzJEN0UzQTMwQUVBQzgKUldUSTZncWo0OWN5MkVSQVAyZGdIZGFhUjBiVGNTc1gxVldFbm1mRDEwS0lBcVRlSXVDZGpUalcK",
+      "endpoints": [
+        "https://github.com/perduta/lol-crawler/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

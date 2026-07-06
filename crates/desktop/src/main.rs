@@ -267,6 +267,21 @@ mod win_toast {
     }
 }
 
+/// One self-update attempt against the GitHub Releases feed. Returns
+/// Ok(true) once a newer build has been downloaded and installed. On
+/// Windows `download_and_install` hands off to the NSIS installer, which
+/// exits this process and relaunches the app itself; other platforms
+/// return here so the caller can restart.
+async fn check_update(app: &AppHandle) -> tauri_plugin_updater::Result<bool> {
+    use tauri_plugin_updater::UpdaterExt;
+    let Some(update) = app.updater()?.check().await? else {
+        return Ok(false);
+    };
+    tracing::info!(version = %update.version, "update available, installing");
+    update.download_and_install(|_, _| {}, || {}).await?;
+    Ok(true)
+}
+
 fn quit(app: &AppHandle) {
     // Best effort: let the uploader flush for a moment before exiting.
     // Anything unflushed is re-issued by the server after the lease.
@@ -308,6 +323,7 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(data)
         .invoke_handler(tauri::generate_handler![get_state, enroll, set_key, fetch_stats])
         .setup(|app| {
@@ -381,6 +397,26 @@ fn main() {
                     }
                 }
             });
+
+            // Self-update: check at launch, then every six hours — the
+            // node lives in the tray for weeks, so a launch-only check
+            // would leave the fleet stale. A restart mid-crawl is fine:
+            // the server re-issues anything unflushed after the lease.
+            // Skipped in dev so target/ builds don't install over
+            // themselves the moment a newer release exists.
+            if !data.mock && !cfg!(debug_assertions) {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        match check_update(&app_handle).await {
+                            Ok(true) => app_handle.restart(),
+                            Ok(false) => {}
+                            Err(e) => tracing::warn!(error = %e, "update check failed"),
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
+                    }
+                });
+            }
 
             start_worker(&data);
             Ok(())

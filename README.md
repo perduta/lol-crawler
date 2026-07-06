@@ -120,9 +120,12 @@ actually enjoy leaving open:
   brings it back. The canvas only animates while visible, the leaderboard
   polls every 45 s, and quitting from the tray drains result uploads.
 
-Windows/macOS builds must currently be produced on that OS (or CI):
-`cargo tauri build` there yields a signed-nothing, single-file installer;
-WebView2 is preinstalled on Windows 10/11.
+Windows installers are published on [GitHub Releases](https://github.com/perduta/lol-crawler/releases)
+by the `release` workflow (tag `v*`), and installed apps self-update from
+there — send someone the installer link once and they stay current. See
+[docs/releasing.md](docs/releasing.md) for the release process. WebView2 is
+preinstalled on Windows 10/11. Other platforms: `cargo tauri build` on that
+OS produces an (unsigned) installer.
 
 ### Backfill
 

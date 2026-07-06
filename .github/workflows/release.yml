@@ -1,0 +1,40 @@
+# Desktop (Crawl Crew) release: push a tag `v<version>` matching
+# crates/desktop/Cargo.toml and this builds the Windows NSIS installer,
+# signs the updater artifact, and publishes a GitHub Release with the
+# `latest.json` manifest that installed apps poll for self-updates.
+#
+# Needs the TAURI_SIGNING_PRIVATE_KEY repo secret (the updater signing
+# key; the matching pubkey is baked into tauri.conf.json).
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  desktop-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        with:
+          projectPath: crates/desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: "Crawl Crew ${{ github.ref_name }}"
+          releaseBody: >
+            Windows installer below (`Crawl.Crew_*_x64-setup.exe`).
+            Installed apps update themselves automatically.
+          args: --bundles nsis
