@@ -21,5 +21,6 @@ design details (crawl strategy, storage format, rate limiting).
 
 - `crates/server/matchrecord.proto` is hand-mirrored by `crates/server/src/record.rs`; `STAT_FIELDS_V1` is append-only — bump `SCHEMA_VERSION` when adding fields.
 - Durability ordering in storage: redb checkpoint → fsync segment blocks → commit seen-bitmaps. Don't reorder.
+- Columnar segment blocks must reconstruct `MatchRecord` protobuf bytes exactly (`encode_block` self-verifies; recompaction verifies before replacing), and recompaction must not touch a UTC date still held by an open `SegmentWriter`.
 - Nodes must stay strategy-agnostic: crawl logic changes go in the server only.
 - A development server instance may be running locally on port 8420 — never kill crawler processes by name.

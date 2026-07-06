@@ -11,6 +11,7 @@
 
 mod api;
 mod broker;
+mod columnar;
 mod config;
 mod crawler;
 mod inspect;
@@ -22,7 +23,12 @@ mod riot;
 mod stats;
 mod storage;
 
-use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
+};
 
 use anyhow::{Context, Result};
 use sha2::Digest;
@@ -41,6 +47,157 @@ pub fn generate_token() -> String {
 pub fn token_hash_hex(token: &str) -> String {
     let d = sha2::Sha256::digest(token.as_bytes());
     d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn spawn_recompactor(
+    data_dir: String,
+    store: Arc<Mutex<Store>>,
+    mut stop: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut delay = Duration::from_secs(30);
+        loop {
+            if *stop.borrow() {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = stop.changed() => break,
+            }
+            run_recompaction_cycle(&data_dir, &store).await;
+            delay = Duration::from_secs(3600);
+        }
+    })
+}
+
+async fn run_recompaction_cycle(data_dir: &str, store: &Arc<Mutex<Store>>) {
+    let open_dates: HashSet<String> = store.lock().await.open_writer_dates().into_iter().collect();
+    let today = chrono::Utc::now().date_naive();
+    let now = SystemTime::now();
+
+    for region in config::enabled_regions() {
+        let platform = region.platform;
+        let dir = Path::new(data_dir).join("matches").join(platform);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+
+        let mut segs: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "seg"))
+            .collect();
+        segs.sort();
+
+        for seg in segs {
+            let Some((date_s, date)) = segment_date(&seg) else {
+                continue;
+            };
+            if date >= today {
+                continue;
+            }
+            // After midnight the writer can still flush buffered records for
+            // the old day for a short while; renaming a file out from under
+            // its open append fd would silently lose those bytes.
+            if open_dates.contains(&date_s) {
+                continue;
+            }
+            if !mtime_older_than(&seg, Duration::from_secs(3600), now) {
+                continue;
+            }
+
+            let idx = seg.with_extension("idx");
+            let seg_for_log = seg.clone();
+            let start = Instant::now();
+            let result =
+                tokio::task::spawn_blocking(move || storage::recompact_segment(&seg, &idx)).await;
+            let duration = start.elapsed();
+            match result {
+                Ok(Ok(outcome)) => {
+                    tracing::info!(
+                        platform,
+                        date = %date_s,
+                        already_compacted = outcome.already_compacted,
+                        rebuilt_idx = outcome.rebuilt_idx,
+                        before_seg_bytes = outcome.before_seg_bytes,
+                        after_seg_bytes = outcome.after_seg_bytes,
+                        before_idx_bytes = outcome.before_idx_bytes,
+                        after_idx_bytes = outcome.after_idx_bytes,
+                        records = outcome.record_count,
+                        duration_ms = duration.as_millis() as u64,
+                        "segment recompaction finished"
+                    );
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        platform,
+                        date = %date_s,
+                        path = %seg_for_log.display(),
+                        error = %err,
+                        "segment recompaction failed; leaving day uncompacted"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        platform,
+                        date = %date_s,
+                        path = %seg_for_log.display(),
+                        error = %err,
+                        "segment recompaction task failed; leaving day uncompacted"
+                    );
+                }
+            }
+        }
+    }
+
+    let raw_data_dir = PathBuf::from(data_dir);
+    let raw_start = Instant::now();
+    match tokio::task::spawn_blocking(move || storage::recompact_raw_samples(&raw_data_dir)).await {
+        Ok(Ok(outcome)) => {
+            if outcome.dict_created || outcome.files_upgraded > 0 || outcome.files_failed > 0 {
+                tracing::info!(
+                    dict_created = outcome.dict_created,
+                    dict_bytes = outcome.dict_bytes,
+                    training_samples = outcome.training_samples,
+                    files_seen = outcome.files_seen,
+                    files_upgraded = outcome.files_upgraded,
+                    files_already_dict = outcome.files_already_dict,
+                    files_skipped_recent = outcome.files_skipped_recent,
+                    files_skipped_changed = outcome.files_skipped_changed,
+                    files_failed = outcome.files_failed,
+                    before_bytes = outcome.before_bytes,
+                    after_bytes = outcome.after_bytes,
+                    duration_ms = raw_start.elapsed().as_millis() as u64,
+                    "raw sample recompression finished"
+                );
+            }
+        }
+        Ok(Err(err)) => {
+            tracing::warn!(
+                error = %err,
+                "raw sample recompression failed; leaving raw samples unchanged"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "raw sample recompression task failed; leaving raw samples unchanged"
+            );
+        }
+    }
+}
+
+fn segment_date(path: &Path) -> Option<(String, chrono::NaiveDate)> {
+    let date_s = path.file_stem()?.to_str()?.to_string();
+    let date = chrono::NaiveDate::parse_from_str(&date_s, "%Y-%m-%d").ok()?;
+    Some((date_s, date))
+}
+
+fn mtime_older_than(path: &Path, age: Duration, now: SystemTime) -> bool {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|mtime| now.duration_since(mtime).ok())
+        .is_some_and(|elapsed| elapsed >= age)
 }
 
 #[tokio::main]
@@ -163,6 +320,11 @@ async fn main() -> Result<()> {
             }
         }));
     }
+    handles.push(spawn_recompactor(
+        data_dir.clone(),
+        store.clone(),
+        stop_rx.clone(),
+    ));
     handles.push(tokio::spawn(metrics::reporter(
         metrics.clone(),
         registry.clone(),

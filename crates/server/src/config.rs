@@ -142,6 +142,10 @@ pub const FLUSH_INTERVAL_SECS: u64 = 60;
 /// ...or when the uncompressed block buffer exceeds this size.
 pub const BLOCK_TARGET_BYTES: usize = 4 * 1024 * 1024;
 pub const ZSTD_LEVEL: i32 = 7;
+/// Closed-day columnar recompaction chunk size. Tunable per run; the design
+/// note measured the useful range at roughly 4k-8k records per block.
+pub const COLUMNAR_RECOMPACT_RECORDS_PER_BLOCK: usize = 6_000;
+pub const COLUMNAR_RECOMPACT_ZSTD_LEVEL: i32 = 19;
 /// Keep raw API JSON (zstd) for this permille of matches, for regression tests.
 pub const RAW_SAMPLE_PERMILLE: u64 = 10; // 1%
 
