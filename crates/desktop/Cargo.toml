@@ -1,6 +1,6 @@
 [package]
 name = "crawler-desktop"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Crawl Crew: Tauri desktop app wrapping the node core"
 license.workspace = true
