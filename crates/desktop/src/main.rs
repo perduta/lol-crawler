@@ -20,6 +20,7 @@ use crawler_proto as proto;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager};
+#[cfg(not(windows))]
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::watch;
 
@@ -171,6 +172,67 @@ fn show_main(app: &AppHandle) {
     }
 }
 
+/// Native WinRT toasts for the key-expiry flow. The notification plugin
+/// can't do this on desktop: clicks are ignored, the toast fades after a
+/// few seconds, and it can't be withdrawn once the key is fixed.
+#[cfg(windows)]
+mod win_toast {
+    use tauri::AppHandle;
+    use tauri_winrt_notification::{Scenario, Toast};
+
+    /// AppUserModelID for the toast. The bundle identifier once installed
+    /// (the bundler's Start Menu shortcut registers it); PowerShell's when
+    /// running out of target/, where no AUMID exists. Same dev/installed
+    /// split tauri-plugin-notification uses.
+    fn app_id(app: &AppHandle) -> String {
+        let in_target = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|d| d.display().to_string()))
+            .is_some_and(|dir| {
+                dir.ends_with("\\target\\debug") || dir.ends_with("\\target\\release")
+            });
+        if in_target {
+            Toast::POWERSHELL_APP_ID.to_string()
+        } else {
+            app.config().identifier.clone()
+        }
+    }
+
+    /// Crawling is paused until the operator acts, so the toast uses the
+    /// reminder scenario: pre-expanded, stays on screen until dismissed
+    /// (Windows honors that only because a button is attached). Clicking
+    /// the body or the button brings the window back.
+    pub fn show_key_needed(app: &AppHandle) {
+        let handle = app.clone();
+        let shown = Toast::new(&app_id(app))
+            .title("Crawl Crew needs a fresh key")
+            .text1("Riot expired your API key (dev keys last 24h).")
+            .text2("Paste a new one and crawling resumes — takes 20 seconds.")
+            .scenario(Scenario::Reminder)
+            .add_button("Open Crawl Crew", "open")
+            .on_activated(move |_action| {
+                // Fires on a WinRT thread; window (re)creation needs main.
+                let h = handle.clone();
+                let _ = handle.run_on_main_thread(move || crate::show_main(&h));
+                Ok(())
+            })
+            .show();
+        if let Err(e) = shown {
+            tracing::warn!(error = %e, "key toast failed");
+        }
+    }
+
+    /// Withdraw our toasts from screen and Action Center. Blanket clear is
+    /// fine: the key reminder is the only toast this app ever sends.
+    pub fn clear(app: &AppHandle) {
+        use windows::core::HSTRING;
+        use windows::UI::Notifications::ToastNotificationManager;
+        if let Ok(history) = ToastNotificationManager::History() {
+            let _ = history.ClearWithId(&HSTRING::from(app_id(app)));
+        }
+    }
+}
+
 fn quit(app: &AppHandle) {
     // Best effort: let the uploader flush for a moment before exiting.
     // Anything unflushed is re-issued by the server after the lease.
@@ -217,6 +279,12 @@ fn main() {
         .setup(|app| {
             let data = app.state::<AppData>();
 
+            // A toast surviving from a previous run is dead (its click
+            // handler died with the process); drop it. If the key is still
+            // bad the worker re-emits KeyBad and a live toast replaces it.
+            #[cfg(windows)]
+            win_toast::clear(app.handle());
+
             // Tray: left-click opens, menu has Open/Quit.
             let open_item = MenuItem::with_id(app, "open", "Open Crawl Crew", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit (stops crawling)", true, None::<&str>)?;
@@ -250,16 +318,27 @@ fn main() {
                 loop {
                     match rx.recv().await {
                         Ok(ev) => {
-                            if matches!(ev, NodeEvent::KeyBad) {
-                                let _ = app_handle
-                                    .notification()
-                                    .builder()
-                                    .title("Crawl Crew needs a fresh key")
-                                    .body(
-                                        "Riot expired your API key (dev keys last 24h). \
-                                         Open Crawl Crew and paste a new one — takes 20 seconds.",
-                                    )
-                                    .show();
+                            match &ev {
+                                NodeEvent::KeyBad => {
+                                    #[cfg(windows)]
+                                    win_toast::show_key_needed(&app_handle);
+                                    #[cfg(not(windows))]
+                                    {
+                                        let _ = app_handle
+                                            .notification()
+                                            .builder()
+                                            .title("Crawl Crew needs a fresh key")
+                                            .body(
+                                                "Riot expired your API key (dev keys last 24h). \
+                                                 Open Crawl Crew and paste a new one — takes 20 seconds.",
+                                            )
+                                            .show();
+                                    }
+                                }
+                                // Key fixed (maybe via CLI): retract the toast.
+                                #[cfg(windows)]
+                                NodeEvent::KeyOk => win_toast::clear(&app_handle),
+                                _ => {}
                             }
                             let _ = app_handle.emit("node", &ev);
                         }
