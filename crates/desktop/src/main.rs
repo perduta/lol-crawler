@@ -23,12 +23,16 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::watch;
 
+mod mock;
+
 struct AppData {
     handle: Arc<NodeHandle>,
     config_path: PathBuf,
     cfg: Mutex<Option<NodeConfig>>,
     stop_tx: Mutex<Option<watch::Sender<bool>>>,
     client: Mutex<Option<Arc<ServerClient>>>,
+    /// `--mock`: fake server + fake Riot, for frontend work (see `mock`).
+    mock: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -60,6 +64,10 @@ fn start_worker(data: &AppData) {
     };
     let (tx, rx) = watch::channel(false);
     *data.stop_tx.lock().unwrap() = Some(tx);
+    if data.mock {
+        tauri::async_runtime::spawn(mock::run(data.handle.clone(), rx));
+        return;
+    }
     *data.client.lock().unwrap() =
         Some(Arc::new(ServerClient::new(&cfg.server, &cfg.token)));
     let handle = data.handle.clone();
@@ -88,16 +96,27 @@ async fn enroll(
         return Err("already enrolled".into());
     }
     let server = server.trim().trim_end_matches('/').to_string();
-    let er = crawler_node::enroll_request(&server, name.trim(), invite.trim())
-        .await
-        .map_err(|e| e.to_string())?;
-    let cfg = NodeConfig {
-        server,
-        name: er.name,
-        token: er.token,
-        riot_api_key: riot_key.trim().to_string(),
+    let cfg = if state.mock {
+        // Accept anything, talk to nobody, save nothing.
+        NodeConfig {
+            server,
+            name: name.trim().to_string(),
+            token: "mock-token".to_string(),
+            riot_api_key: riot_key.trim().to_string(),
+        }
+    } else {
+        let er = crawler_node::enroll_request(&server, name.trim(), invite.trim())
+            .await
+            .map_err(|e| e.to_string())?;
+        let cfg = NodeConfig {
+            server,
+            name: er.name,
+            token: er.token,
+            riot_api_key: riot_key.trim().to_string(),
+        };
+        config::save(&state.config_path, &cfg).map_err(|e| e.to_string())?;
+        cfg
     };
-    config::save(&state.config_path, &cfg).map_err(|e| e.to_string())?;
     *state.cfg.lock().unwrap() = Some(cfg);
     start_worker(&state);
     Ok(ui_state(&state))
@@ -108,14 +127,26 @@ fn set_key(key: String, state: tauri::State<'_, AppData>) -> Result<(), String> 
     let mut guard = state.cfg.lock().unwrap();
     let cfg = guard.as_mut().ok_or("not enrolled")?;
     cfg.riot_api_key = key.trim().to_string();
-    config::save(&state.config_path, cfg).map_err(|e| e.to_string())?;
-    // Skip the paused loop's 15 s mtime poll.
+    if !state.mock {
+        config::save(&state.config_path, cfg).map_err(|e| e.to_string())?;
+    }
+    // Skip the paused loop's 15 s mtime poll (in mock: resume immediately).
     state.handle.key_update.notify_waiters();
     Ok(())
 }
 
 #[tauri::command]
 async fn fetch_stats(state: tauri::State<'_, AppData>) -> Result<proto::StatsResponse, String> {
+    if state.mock {
+        let you = state
+            .cfg
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| c.name.clone())
+            .ok_or("not enrolled")?;
+        return Ok(mock::stats(&you, &state.handle));
+    }
     let client = state
         .client
         .lock()
@@ -161,14 +192,22 @@ fn main() {
         )
         .init();
 
+    let mock = std::env::args().any(|a| a == "--mock")
+        || std::env::var("CRAWL_CREW_MOCK").is_ok_and(|v| !v.is_empty() && v != "0");
+    if mock {
+        tracing::info!("MOCK MODE: fake server + fake Riot, config on disk untouched");
+    }
     let config_path = config::default_path();
-    let cfg = config::load(&config_path).unwrap_or_default();
+    // Mock mode ignores any real enrollment on disk so the enrollment
+    // form is testable too (fill it with anything).
+    let cfg = if mock { None } else { config::load(&config_path).unwrap_or_default() };
     let data = AppData {
         handle: NodeHandle::new(),
         config_path,
         cfg: Mutex::new(cfg),
         stop_tx: Mutex::new(None),
         client: Mutex::new(None),
+        mock,
     };
 
     tauri::Builder::default()

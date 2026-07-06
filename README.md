@@ -92,6 +92,13 @@ sees fetched bodies.
 cargo build --release -p crawler-desktop   # needs webkit2gtk-4.1/gtk3 dev libs on Linux
 ```
 
+Working on the frontend? `cargo run -p crawler-desktop -- --mock` (or env
+`CRAWL_CREW_MOCK=1`) fakes both the server and Riot: the enrollment form
+accepts anything, fake jobs stream through the visualization, the
+leaderboard is fabricated, and the on-disk node config is never touched.
+The script also plays a disconnect blip every ~90 s and a one-time key
+expiry at ~150 s so every UI state is reachable.
+
 Same node core as the CLI, wrapped in a warm little app your friends will
 actually enjoy leaving open:
 
