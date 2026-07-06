@@ -7,4 +7,4 @@ license = "MIT OR Apache-2.0"
 authors = ["Patryk Perduta"]
 
 [profile.release]
-lto = true
+lto = "thin"
