@@ -24,3 +24,10 @@ serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Windows: drive WinRT toasts directly (click-to-open, reminder scenario,
+# Action Center cleanup) — the notification plugin exposes none of that on
+# desktop. Both crates are already in the plugin's own dependency tree.
+[target."cfg(windows)".dependencies]
+tauri-winrt-notification = "0.7"
+windows = { version = "0.61", features = ["UI_Notifications"] }
