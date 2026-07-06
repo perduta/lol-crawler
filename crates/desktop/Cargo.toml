@@ -31,3 +31,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [target."cfg(windows)".dependencies]
 tauri-winrt-notification = "0.7"
 windows = { version = "0.61", features = ["UI_Notifications"] }
+winreg = "0.55"

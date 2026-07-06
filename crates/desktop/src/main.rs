@@ -177,13 +177,19 @@ fn show_main(app: &AppHandle) {
 /// few seconds, and it can't be withdrawn once the key is fixed.
 #[cfg(windows)]
 mod win_toast {
+    use std::sync::OnceLock;
+
     use tauri::AppHandle;
     use tauri_winrt_notification::{Scenario, Toast};
 
-    /// AppUserModelID for the toast. The bundle identifier once installed
-    /// (the bundler's Start Menu shortcut registers it); PowerShell's when
-    /// running out of target/, where no AUMID exists. Same dev/installed
-    /// split tauri-plugin-notification uses.
+    /// AppUserModelID for the toast. Installed builds use the bundle
+    /// identifier (the bundler's Start Menu shortcut registers it, giving
+    /// the toast our name and icon). Builds running out of target/ have no
+    /// such registration, so we register a per-user `<identifier>.dev`
+    /// AUMID in HKCU on first use — the shortcut-free route Windows
+    /// supports for unpackaged apps. The `.dev` suffix keeps it from ever
+    /// shadowing the installed app's identity. If registration fails we
+    /// borrow PowerShell's AUMID (toast works, wrong attribution).
     fn app_id(app: &AppHandle) -> String {
         let in_target = std::env::current_exe()
             .ok()
@@ -191,11 +197,39 @@ mod win_toast {
             .is_some_and(|dir| {
                 dir.ends_with("\\target\\debug") || dir.ends_with("\\target\\release")
             });
-        if in_target {
-            Toast::POWERSHELL_APP_ID.to_string()
-        } else {
-            app.config().identifier.clone()
+        if !in_target {
+            return app.config().identifier.clone();
         }
+        static DEV_AUMID: OnceLock<String> = OnceLock::new();
+        DEV_AUMID
+            .get_or_init(|| {
+                register_dev_aumid(app).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "dev AUMID registration failed");
+                    Toast::POWERSHELL_APP_ID.to_string()
+                })
+            })
+            .clone()
+    }
+
+    /// Idempotent; the key persists in HKCU (a few bytes) so attribution
+    /// also survives for toasts left in the Action Center after exit.
+    fn register_dev_aumid(app: &AppHandle) -> std::io::Result<String> {
+        let aumid = format!("{}.dev", app.config().identifier);
+        let display = format!(
+            "{} (dev)",
+            app.config().product_name.as_deref().unwrap_or("Crawl Crew")
+        );
+        let (key, _) = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+            .create_subkey(format!(r"Software\Classes\AppUserModelId\{aumid}"))?;
+        key.set_value("DisplayName", &display)?;
+        // Compile-time path: only ever used by builds run from target/.
+        let icon = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("icons")
+            .join("icon.ico");
+        if icon.exists() {
+            key.set_value("IconUri", &icon.display().to_string())?;
+        }
+        Ok(aumid)
     }
 
     /// Crawling is paused until the operator acts, so the toast uses the
