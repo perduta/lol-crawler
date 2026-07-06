@@ -134,6 +134,23 @@ function toast(text) {
   toastTimer = setTimeout(() => t.classList.remove("show"), 4200);
 }
 
+// ---------- easter egg ----------
+// Ten rapid clicks anywhere (each within 500 ms of the last) pop the
+// milestone confetti on demand. Resets on trigger, so the restless can
+// keep going.
+let eggClicks = 0;
+let eggLast = 0;
+window.addEventListener("pointerdown", () => {
+  const now = performance.now();
+  eggClicks = now - eggLast < 500 ? eggClicks + 1 : 1;
+  eggLast = now;
+  if (eggClicks >= 10) {
+    eggClicks = 0;
+    viz.confetti();
+    toast("🎉 you found the confetti stash — carry on");
+  }
+});
+
 // ---------- canvas visualization ----------
 // One orb per job, following its real lifecycle:
 //   wait   — pulled from the server, queued on the local rate limiter:
